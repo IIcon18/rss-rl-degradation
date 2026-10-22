@@ -218,3 +218,25 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# ---- Проект rss-rl-degradation ----
+# Настройки PyCharm
+.idea/
+# macOS
+.DS_Store
+# Личные заметки для Claude Code
+CLAUDE.md
+CLAUDE.local.md
+.claude/
+# Результаты: большие таблицы, логи и модели не коммитим,
+# графики для статьи кладем в results/figures/ и коммитим
+results/*
+!results/.gitkeep
+!results/figures/
+models/
+logs/
+runs/
+wandb/
+*.zip
+*.pt
+*.pth
