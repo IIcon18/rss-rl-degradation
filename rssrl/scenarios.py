@@ -16,11 +16,12 @@ import gymnasium as gym
 import highway_env  # noqa: F401  регистрирует highway-v0
 
 from rssrl.logger import EpisodeLogger
-from rssrl.rss import d_min_longitudinal
-from rssrl.shield import ShieldedVehicle, longitudinal_speed, neighbours, relation
+from rssrl.rss import DEFAULT, d_min_longitudinal
+from rssrl.shield import LEMMA2, SHIELD_DEFAULT, ShieldedVehicle, longitudinal_speed, neighbours, relation
 from rssrl.violators import BrakingViolator, CutInViolator
 
 BACKGROUND = "rssrl.violators.BoundedIDMVehicle"
+RHO = DEFAULT.rho  # основная задержка реакции фильтра, с
 IDLE = 1  # DiscreteMetaAction: держать полосу и целевую скорость
 
 # Исход эпизода «остановка»: агент стоял (скорость < STOP_SPEED) не меньше STOP_DURATION
@@ -57,14 +58,23 @@ def find_leader(env):
 class ViolationDirector:
     """Назначает тормозящего нарушителя в момент нарушения.
 
-    Перед каждым шагом симуляции проверяет условие: прошло >= t_min секунд,
-    перед агентом есть машина и зазор до нее <= trigger_ratio·d_min.
-    Как только условие выполнено, эта машина заменяется нарушителем в том же
-    состоянии, и он сразу начинает тормозить с β·5 м/с^2. До этого момента
-    в сцене только обычные фоновые машины, поэтому сцена одинакова для всех β.
+    Два способа выбрать момент:
+    1. По зазору (schedule=None, как в пилотах): перед каждым шагом симуляции
+       проверяется условие: прошло >= t_min секунд, перед агентом есть машина
+       и зазор до нее <= trigger_ratio·d_min. Как только условие выполнено,
+       эта машина заменяется нарушителем в том же состоянии, и он сразу
+       начинает тормозить к β·5 м/с^2. Момент и машина зависят от того, как
+       ехал агент, поэтому у разных вариантов агента они могут различаться.
+    2. По расписанию (schedule={"t": момент, "uid": машина}): в момент t
+       нарушителем становится машина uid, где бы ни был агент. Расписание
+       берется из эталонного прогона (violation_schedule), и тогда момент и
+       машина одинаковы для всех вариантов агента на этой сцене.
+    До момента нарушения в сцене только обычные фоновые машины, поэтому
+    сцена одинакова для всех β.
     """
 
-    def __init__(self, env, ego, logger, beta, t_min, trigger_ratio=TRIGGER_RATIO):
+    def __init__(self, env, ego, logger, beta, t_min, trigger_ratio=TRIGGER_RATIO, schedule=None):
+        self.schedule = dict(schedule) if schedule else None
         self.ego, self.logger, self.beta = ego, logger, beta
         self.trigger_ratio, self.t_min = trigger_ratio, t_min
         self.road = env.unwrapped.road
@@ -92,9 +102,32 @@ class ViolationDirector:
         self.t_trigger = self.t
         self.logger.set_violator(vio)
 
+    def _scheduled_vehicle(self):
+        """Машина из расписания, если ее момент настал (иначе None). Если
+        машины уже нет на дороге или она разбита, нарушения не будет."""
+        if self.t < self.schedule["t"] - 1e-9:
+            return None
+        v = next((v for v in self.road.vehicles if getattr(v, "uid", None) == self.schedule["uid"]), None)
+        self.info["violator_was_front"] = self.ego.state.get("front_id") == self.schedule["uid"]
+        if v is None or v.crashed:
+            self.schedule["t"] = math.inf  # больше не проверять
+            self.info["schedule_missed"] = True
+            return None
+        return v
+
     def check(self):
+        if self.schedule is not None:
+            v = self._scheduled_vehicle()
+            if v is not None:
+                self._assign(BrakingViolator.replace(v, beta=self.beta, trigger_time=0.0))
+            return
         s = self.ego.state
-        if s.get("front_id") is None or s["gap"] > self.trigger_ratio * s["d_min"]:
+        if s.get("front_id") is None:
+            return
+        # условие сцены — по d_min леммы 2 (DEFAULT), а не по d_min фильтра:
+        # так сцена одинакова для любого варианта формулы в фильтре
+        v_e = max(0.0, longitudinal_speed(self.ego, self.ego.lane))
+        if s["gap"] > self.trigger_ratio * d_min_longitudinal(v_e, max(0.0, s["v_front"]), DEFAULT):
             return
         front = self._vehicle(s["front_id"])
         self._assign(BrakingViolator.replace(front, beta=self.beta, trigger_time=0.0))
@@ -119,13 +152,33 @@ class CutInDirector(ViolationDirector):
     заданного — это записывается.
     """
 
-    def __init__(self, env, ego, logger, beta, t_min, gamma, lc_duration=LC_DURATION):
-        super().__init__(env, ego, logger, beta, t_min)
+    def __init__(self, env, ego, logger, beta, t_min, gamma, lc_duration=LC_DURATION, schedule=None):
+        super().__init__(env, ego, logger, beta, t_min, schedule=schedule)
         self.gamma, self.lc_duration = gamma, lc_duration
         self.prev_margin = {}  # uid -> (прогноз - γ·d_min) на прошлом шаге
 
+    def _start(self, v, lane_index):
+        cutter = CutInViolator.replace(v, beta=self.beta)
+        cutter.lc_duration = self.lc_duration
+        cutter.on_cross = self.on_cross
+        self._assign(cutter)
+        cutter.start_cut(lane_index)
+
     def check(self):
-        ego, p = self.ego, self.ego.params
+        if self.schedule is not None:
+            # по расписанию: машина uid в момент t перестраивается в полосу lane
+            # (полоса агента в эталонном прогоне), если она в соседней с ней полосе
+            v = self._scheduled_vehicle()
+            if v is None:
+                return
+            lane = self.schedule["lane"]
+            if v.lane_index[:2] != lane[:2] or abs(v.lane_index[2] - lane[2]) != 1:
+                self.schedule["t"] = math.inf
+                self.info["schedule_missed"] = True
+                return
+            self._start(v, lane)
+            return
+        ego, p = self.ego, DEFAULT  # γ·d_min — по лемме 2, независимо от фильтра
         lane = ego.lane
         s_e, _ = lane.local_coordinates(ego.position)
         vx_e = longitudinal_speed(ego, lane)
@@ -151,16 +204,12 @@ class CutInDirector(ViolationDirector):
             self.prev_margin[v.uid] = margin
             room = s_leader - (s_v + vx_v * t_cross) >= v.LENGTH + ROOM_MARGIN
             if prev is not None and prev > 0 >= margin and gap_pred > 0 and room:
-                cutter = CutInViolator.replace(v, beta=self.beta)
-                cutter.lc_duration = self.lc_duration
-                cutter.on_cross = self.on_cross
-                self._assign(cutter)
-                cutter.start_cut(ego.lane_index)
+                self._start(v, ego.lane_index)
                 self.info.update({"gap_pred": gap_pred, "d_min_pred": d_pred})
                 return
 
     def on_cross(self, cutter):
-        r = relation(self.ego, cutter, self.ego.params)
+        r = relation(self.ego, cutter, DEFAULT)
         self.info.update({
             "t_cross": cutter.clock,
             "gap_cross": r["long_gap"],
@@ -194,26 +243,32 @@ class Scene:
         return self.director.violator
 
 
-def make_scene(seed, beta=1.0, shield=True, reaction_delay=0.0, kind="brake", gamma=1.0,
-               t_min=TRIGGER_T_MIN, **config):
+def make_scene(seed, beta=1.0, shield=True, reaction_delay=RHO, kind="brake", gamma=1.0,
+               t_min=TRIGGER_T_MIN, schedule=None, dmin="jerk", **config):
     """Сцена эксперимента.
 
     - агент: ShieldedVehicle с фильтром (shield=True) или без,
-      reaction_delay — задержка реакции фильтра, с;
+      reaction_delay — задержка реакции фильтра, с (основной режим ρ = 0,5 с,
+      дополнительный — 0);
     - kind="brake": нарушитель — машина непосредственно перед агентом в момент
       нарушения (ViolationDirector); тормозит с β·5 м/с^2 до остановки и стоит;
     - kind="cutin": нарушитель — машина из соседней полосы, подрезает агента
       с зазором γ·d_min на разметке и тормозит с β·5 м/с^2 (CutInDirector).
       Чтобы было куда подрезать, на старте из полосы агента убираются машины
       на CUTIN_FREE_AHEAD м вперед (одинаково для всех вариантов агента и всех γ);
-    - kind="nominal": нарушителя нет (проверка номинального режима).
+    - kind="nominal": нарушителя нет (проверка номинального режима);
+    - dmin — формула d_min в фильтре: "jerk" (по умолчанию, лемма 2 с учетом
+      рывка) или "lemma2" (как в статье);
+    - schedule — нарушение по расписанию (см. ViolationDirector и
+      violation_schedule) вместо условия по зазору.
     """
     env = make_env(seed, **config)
     u = env.unwrapped
     for i, v in enumerate(u.road.vehicles):
         v.uid = i  # постоянные номера машин для логов
 
-    ego = ShieldedVehicle.replace(u.vehicle, shield_enabled=shield, reaction_delay=reaction_delay)
+    params = {"jerk": SHIELD_DEFAULT, "lemma2": LEMMA2}[dmin]
+    ego = ShieldedVehicle.replace(u.vehicle, shield_enabled=shield, reaction_delay=reaction_delay, params=params)
     ego.uid = 0
     u.vehicle = ego
     if kind == "cutin":
@@ -227,14 +282,46 @@ def make_scene(seed, beta=1.0, shield=True, reaction_delay=0.0, kind="brake", ga
 
     logger = EpisodeLogger(env, ego)
     if kind == "brake":
-        director = ViolationDirector(env, ego, logger, beta, t_min)
+        director = ViolationDirector(env, ego, logger, beta, t_min, schedule=schedule)
     elif kind == "cutin":
-        director = CutInDirector(env, ego, logger, beta, t_min, gamma)
+        director = CutInDirector(env, ego, logger, beta, t_min, gamma, schedule=schedule)
     elif kind == "nominal":
         director = NoViolationDirector(env, ego, logger, beta, t_min)
     else:
         raise ValueError(kind)
     return Scene(env, ego, director, logger, seed, kind, beta, gamma, shield, reaction_delay)
+
+
+def violation_schedule(seed, kind="brake", gamma=1.0, shield=True, reaction_delay=RHO,
+                       policy=None, **config):
+    """Расписание нарушения для сцены seed из эталонного прогона.
+
+    Эталонный агент (по умолчанию IDLE с фильтром и задержкой ρ) едет, пока
+    сцена не назначит нарушителя по условию на зазор. Возвращает
+    {"t": момент, "uid": машина, "lane": полоса агента в этот момент} или
+    None, если нарушения не было. Момент до нарушения от β не зависит.
+    """
+    scene = make_scene(seed, kind=kind, gamma=gamma, shield=shield, reaction_delay=reaction_delay, **config)
+    env, director = scene.env, scene.director
+    policy = policy or (lambda obs: IDLE)
+    obs = env.unwrapped.observation_type.observe()
+    done = False
+    lane = None
+    original_assign = director._assign
+
+    def assign_and_remember(vio):
+        nonlocal lane
+        lane = scene.ego.lane_index
+        original_assign(vio)
+
+    director._assign = assign_and_remember
+    while not done and director.violator is None:
+        obs, _, terminated, truncated, _ = env.step(policy(obs))
+        done = terminated or truncated
+    env.close()
+    if director.violator is None:
+        return None
+    return {"t": director.t_trigger, "uid": director.violator.uid, "lane": lane}
 
 
 def classify_outcome(log, dt=1 / 15):
@@ -292,6 +379,10 @@ def run_episode(scene, policy=None, t_stop=None):
         "outcome": result,
         "collision": bool(scene.ego.crashed),
         "t_crash": float(log.loc[log["crashed"], "t"].min()) if log["crashed"].any() else None,
+        # скорость агента на последнем шаге перед ударом, м/с
+        "v_impact": float(log.loc[: log.index[log["crashed"]].min(), "ego_v"].iloc[-2])
+        if log["crashed"].any() and log["crashed"].idxmax() > 0 else None,
+        "violator_uid": vio.uid if vio is not None else None,
         "hit_violator": vio is not None and vio.uid in partners,
         "crash_partners": partners,
         "t_end": float(log["t"].iloc[-1]),
@@ -300,6 +391,8 @@ def run_episode(scene, policy=None, t_stop=None):
         "triggered": vio is not None,
         "t_trigger": scene.director.t_trigger,
         "t_brake": events[0]["t_start"] if events else None,
+        "scheduled": scene.director.schedule is not None,
+        "dmin": "jerk" if scene.ego.params.jerk is not None else "lemma2",
         "shield_steps": int(log["shield_active"].sum()),
         **scene.director.info,
     }

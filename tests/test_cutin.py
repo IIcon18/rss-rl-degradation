@@ -100,6 +100,42 @@ def test_started_lane_change_is_cancelled_when_it_becomes_dangerous():
     assert ego.target_lane_index == origin
 
 
+def test_no_cancel_back_into_unsafe_origin_lane():
+    """Отмена не должна сама создавать опасность: если в исходную полосу
+    за это время встала машина ближе d_min, агент не возвращается (а на
+    опасность впереди отвечает торможением)."""
+    env, ego = road_with_ego()
+    origin = ego.target_lane_index
+    ego.act("LANE_LEFT")
+    target = ego.target_lane_index
+    for _ in range(5):
+        ego.step(SIM_DT)
+        ego.act()
+    add_car(env, 8.0, 0.0, 25.0)  # опасность в целевой полосе
+    add_car(env, 6.0, LANE_W, 25.0)  # и исходная полоса занята рядом
+    ego.act()
+    assert ego.state["lc_decision"] is None
+    assert ego.target_lane_index == target
+
+
+def test_lane_change_completed_after_crossing_the_line():
+    """Как только центр агента пересек разметку, перестроение завершено:
+    опасность впереди в новой полосе — повод тормозить, а не уходить назад."""
+    env, ego = road_with_ego()
+    origin = ego.target_lane_index
+    ego.act("LANE_LEFT")
+    target = ego.target_lane_index
+    while ego.lane_index != target:
+        ego.step(SIM_DT)
+        ego.act()
+    assert ego.lc_origin is None
+    add_car(env, ego.position[0] + 10.0, 0.0, 25.0)  # 10 м впереди в новой полосе
+    ego.act()
+    assert ego.state["lc_decision"] is None and ego.target_lane_index == target
+    assert ego.state["shield_active"] or ego.state["shield_mode"] == "delay"
+    assert origin != target
+
+
 # ---------- подрезающий нарушитель ----------
 
 def triggered_cutin(gamma, shield=False, seeds=range(12)):
@@ -161,12 +197,32 @@ def test_cutter_brakes_from_line_crossing(cutins_noshield):
 
 
 @pytest.mark.parametrize("delay", [0.0, DEFAULT.rho])
-def test_legal_cutin_gamma_1_no_collisions_with_shield(delay):
+def test_legal_cutin_gamma_1_no_collisions_with_shield(delay, monkeypatch):
     """γ = 1 (подрезание с зазором d_min, затем торможение 5 м/с^2) законно
-    по RSS: с фильтром столкновений быть не должно."""
+    по RSS: с фильтром столкновений быть не должно.
+
+    Проверяем логику фильтра в условиях леммы 2, то есть без предела рывка
+    (лемма считает, что торможение a_min_brake начинается мгновенно после ρ).
+    С пределом рывка J_MAX к ρ добавляется время набора торможения, и
+    гарантия леммы 2 как в статье уже не действует; для этого случая фильтр
+    по умолчанию считает d_min с учетом рывка (тест ниже)."""
+    monkeypatch.setattr("rssrl.dynamics.J_MAX", math.inf)
+    n = 0
+    for seed in range(12):
+        outcome, _ = run_episode(make_scene(seed, shield=True, reaction_delay=delay, kind="cutin", gamma=1.0,
+                                            dmin="lemma2"))
+        n += outcome["triggered"]
+        assert not outcome["collision"], (seed, outcome)
+    assert n >= 4
+
+
+@pytest.mark.parametrize("delay", [0.0, DEFAULT.rho])
+def test_legal_cutin_gamma_1_with_jerk_and_jerk_aware_dmin(delay):
+    """γ = 1 с рывком 10 м/с^3 у всех машин и d_min фильтра с учетом рывка
+    (по умолчанию): столкновений быть не должно."""
     n = 0
     for seed in range(12):
         outcome, _ = run_episode(make_scene(seed, shield=True, reaction_delay=delay, kind="cutin", gamma=1.0))
         n += outcome["triggered"]
-        assert not outcome["collision"], (seed, outcome)
+        assert not outcome["collision"], (seed, outcome["v_impact"])
     assert n >= 4

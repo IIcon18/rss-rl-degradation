@@ -18,19 +18,36 @@ ShieldedVehicle — машина агента. Политика (PPO или пи
 1. Продольная. Если опасна машина впереди — тормозить не слабее a_min_brake
    (если политика сама тормозит сильнее, сильнее и тормозим), держать,
    пока опасных машин впереди не останется, затем вернуть управление.
+   Экстренный режим: если по прогнозу даже торможение a_min_brake не спасает
+   от столкновения, фильтр тормозит с физическим пределом машины
+   A_PHYS_BRAKE = 8 м/с^2 (rssrl/dynamics.py) и держит его, пока опасность
+   не пройдет. Прогноз (brake_insufficient): агент от своего текущего
+   ускорения выходит на -a_min_brake с рывком J_MAX и тормозит до остановки;
+   машина впереди с этого момента тормозит с max(a_max_brake, ее текущее
+   фактическое торможение) — то есть по допущению RSS, а если она уже
+   тормозит сильнее допущения, то так, как тормозит. Если зазор в прогнозе
+   доходит до нуля — a_min_brake не хватает.
+   Режим фильтра на каждом шаге пишется в лог (shield_mode): None — опасности
+   нет; "delay" — опасно, но идет время реакции ρ; "brake" — торможение
+   a_min_brake; "emergency" — экстренное торможение.
 2. Перестроения. Новое перестроение политики запрещается, если в целевой
    полосе есть машина, с которой продольно небезопасно (после перестроения
    ситуация стала бы опасной). Начатое перестроение отменяется (агент
    возвращается в исходную полосу), если с машиной в целевой полосе стало
-   опасно.
+   опасно, — но только пока агент не пересек разметку и только если
+   вернуться безопасно (в исходной полосе никто не оказался ближе d_min).
+   После пересечения разметки перестроение считается завершенным, и на
+   опасность впереди фильтр отвечает торможением.
 
 Задержка реакции (reaction_delay), касается продольного торможения:
-- 0: фильтр тормозит уже на текущем шаге симуляции. ρ тогда остается только
-  запасом внутри формулы d_min (лемма разрешает задней машине ρ секунд
-  разгоняться, а фильтр сразу тормозит);
-- ρ = 0,5 с: пока не прошло ρ после последнего безопасного момента,
-  исполняется команда политики (не больше a_max_accel), потом торможение.
-  Так ведет себя машина в предположении леммы 2.
+- ρ = 0,5 с (основной режим, по умолчанию): пока не прошло ρ после
+  последнего безопасного момента, исполняется команда политики
+  (не больше a_max_accel), потом торможение. Так ведет себя машина в
+  предположении леммы 2;
+- 0 (дополнительный вариант, «мгновенный фильтр»): фильтр тормозит уже на
+  текущем шаге симуляции. ρ тогда остается только запасом внутри формулы
+  d_min (лемма разрешает задней машине ρ секунд разгоняться, а фильтр
+  сразу тормозит).
 Отсчет идет от последнего безопасного шага, а не от шага, где опасность
 заметили: лемма гарантирует безопасность, только если торможение началось
 не позже чем через ρ после момента, когда зазор еще был >= d_min.
@@ -38,19 +55,35 @@ ShieldedVehicle — машина агента. Политика (PPO или пи
 Запрет и отмена перестроения действуют сразу (это не торможение, а отказ
 от маневра).
 
-Физические пределы машины агента одинаковы с фильтром и без:
-ускорение в [-a_max_brake, a_max_accel] = [-5, 3] м/с^2, задом не едет.
-Верхний предел 3 м/с^2 нужен, чтобы агент не разгонялся сильнее, чем
-предполагает формула d_min.
+Пределы машины агента:
+- команда политики обрезается до [-a_max_brake, a_max_accel] = [-5, 3] м/с^2
+  (с фильтром и без одинаково). Верхний предел 3 м/с^2 нужен, чтобы агент
+  не разгонялся сильнее, чем предполагает формула d_min;
+- сильнее 5 м/с^2 тормозит только экстренный режим фильтра (до 8 м/с^2);
+- ускорение меняется не быстрее J_MAX = 10 м/с^3 (предел рывка): чтобы из
+  движения с +3 м/с^2 выйти на -4 м/с^2, нужно 0,7 с. Это время добавляется
+  к ρ, а лемма 2 как в статье его не учитывает (она считает, что торможение
+  a_min_brake начинается мгновенно). Поэтому фильтр по умолчанию считает
+  d_min по лемме 2 с учетом рывка (SHIELD_DEFAULT, rssrl/rss.py): с d_min
+  как в статье (LEMMA2) агент при β = 1 въезжал в стоящую машину на 2–4 м/с;
+- задом не едет.
 """
 
 import math
 
 from highway_env.vehicle.controller import MDPVehicle
 
+from dataclasses import replace
+
+from rssrl.dynamics import A_PHYS_BRAKE, J_MAX, limit_jerk
 from rssrl.rss import DEFAULT, d_min_lateral, d_min_longitudinal
 
 SENSE_RADIUS = 150.0  # м, фильтр видит все машины в этом радиусе
+# Параметры фильтра по умолчанию: d_min по лемме 2 с учетом рывка J_MAX
+# (машина агента набирает торможение не мгновенно). LEMMA2 — d_min как в
+# статье, для сравнения.
+SHIELD_DEFAULT = replace(DEFAULT, jerk=J_MAX)
+LEMMA2 = DEFAULT
 SIM_DT = 1 / 15  # шаг симуляции highway-v0, с
 
 
@@ -133,6 +166,32 @@ def critical_ahead(relations):
     return min(candidates, key=lambda r: r["long_gap"] - r["d_long"])
 
 
+def brake_insufficient(gap, v_rear, v_front, a_rear, b_front, b_rear, dt=SIM_DT,
+                       j_max=None, horizon=15.0):
+    """Прогноз: хватит ли задней машине торможения b_rear.
+
+    Задняя машина (скорость v_rear, текущее ускорение a_rear) выходит на
+    ускорение -b_rear с рывком j_max (по умолчанию J_MAX) и тормозит до остановки. Передняя
+    (v_front) с этого момента тормозит с постоянным b_front до остановки.
+    Интегрирование — как в highway-env (сначала положение по старой
+    скорости, потом скорость). True, если зазор gap доходит до нуля.
+    """
+    x_r, x_f = 0.0, gap
+    v_r, v_f, a = v_rear, v_front, a_rear
+    for _ in range(int(horizon / dt)):
+        a = limit_jerk(-b_rear, a, dt, j_max)
+        a_eff = max(a, -v_r / dt)
+        x_r += v_r * dt
+        x_f += v_f * dt
+        v_r += a_eff * dt
+        v_f = max(0.0, v_f - b_front * dt)
+        if x_f - x_r <= 0:
+            return True
+        if v_r <= 1e-9:
+            return False
+    return False
+
+
 def find_front(ego, radius=SENSE_RADIUS, p=DEFAULT):
     """Критичная машина впереди и зазор до нее (или None, inf)."""
     r = critical_ahead([relation(ego, v, p) for v in neighbours(ego, radius)])
@@ -142,7 +201,7 @@ def find_front(ego, radius=SENSE_RADIUS, p=DEFAULT):
 class ShieldedVehicle(MDPVehicle):
     """Машина агента с RSS-фильтром (shield_enabled=False — тот же код без фильтра)."""
 
-    def __init__(self, *args, shield_enabled=True, params=DEFAULT, reaction_delay=0.0, **kwargs):
+    def __init__(self, *args, shield_enabled=True, params=SHIELD_DEFAULT, reaction_delay=DEFAULT.rho, **kwargs):
         super().__init__(*args, **kwargs)
         self.shield_enabled = shield_enabled
         self.params = params
@@ -151,13 +210,15 @@ class ShieldedVehicle(MDPVehicle):
         # для контрфактического прогона: с этого момента фильтр не вмешивается
         self.shield_off_at = math.inf
         self.last_safe = 0.0  # время начала последнего шага, на котором было безопасно
+        self.emergency = False  # фильтр в экстренном режиме (до конца опасности)
+        self.a_prev = 0.0  # ускорение, исполненное на прошлом шаге, м/с^2
         self.lc_origin = None  # полоса, из которой начато текущее перестроение
         self.state = {}  # решение на текущем шаге, читает логгер
         self._last_act_clock = None
         self._last_lc = (False, None)
 
     @classmethod
-    def replace(cls, vehicle, shield_enabled=True, params=DEFAULT, reaction_delay=0.0):
+    def replace(cls, vehicle, shield_enabled=True, params=SHIELD_DEFAULT, reaction_delay=DEFAULT.rho):
         """Заменить машину агента в среде на ShieldedVehicle в том же состоянии."""
         new = cls(
             vehicle.road,
@@ -228,9 +289,11 @@ class ShieldedVehicle(MDPVehicle):
                 decision = "blocked"
             else:
                 self.lc_origin = previous_target
-        elif self.lc_origin is not None and target != self.lc_origin:
-            # перестроение идет
-            if self._lane_change_dangerous(target, relations):
+        elif self.lc_origin is not None and target != self.lc_origin and self.lane_index != target:
+            # перестроение идет, агент еще не пересек разметку. Отменяем, только
+            # если возвращаться безопасно: уход в исходную полосу не должен сам
+            # создавать опасную ситуацию (туда мог перестроиться кто-то другой)
+            if self._lane_change_dangerous(target, relations) and not self._lane_change_blocked(self.lc_origin, relations):
                 decision = "cancelled"
         if decision and self.filtering:
             back = previous_target if decision == "blocked" else self.lc_origin
@@ -239,9 +302,9 @@ class ShieldedVehicle(MDPVehicle):
             steering = self.steering_control(back)
             self.action["steering"] = max(-self.MAX_STEERING_ANGLE, min(self.MAX_STEERING_ANGLE, steering))
         if self.lc_origin is not None and self.lane_index == self.target_lane_index:
-            _, y = self.lane.local_coordinates(self.position)
-            if abs(y) < 0.2:
-                self.lc_origin = None  # перестроение завершено
+            # центр машины уже в целевой полосе (пересек разметку): перестроение
+            # завершено, дальше на опасность впереди — только торможение
+            self.lc_origin = None
         return decision
 
     # ---------- главный цикл ----------
@@ -272,8 +335,18 @@ class ShieldedVehicle(MDPVehicle):
         reacting = dangerous and self.clock - self.last_safe + SIM_DT > self.reaction_delay + 1e-9
         executed = nominal
         active = self.filtering and reacting
+        mode = "delay" if self.filtering and dangerous else None
+        if not dangerous:
+            self.emergency = False
         if active:
-            executed = min(nominal, -p.a_min_brake)
+            if not self.emergency:
+                self.emergency = self._needs_emergency(relations)
+            if self.emergency:
+                executed = -A_PHYS_BRAKE
+                mode = "emergency"
+            else:
+                executed = min(nominal, -p.a_min_brake)
+                mode = "brake"
         self.action["acceleration"] = executed
 
         self.state = {
@@ -288,6 +361,9 @@ class ShieldedVehicle(MDPVehicle):
             "d_lat": crit["d_lat"] if crit else math.nan,
             "dangerous": dangerous,
             "shield_active": active,
+            "shield_mode": mode,
+            "danger_ahead_ids": [getattr(r["vehicle"], "uid", None) for r in relations if r["dangerous"] and r["ahead"]],
+            "danger_behind_ids": [getattr(r["vehicle"], "uid", None) for r in relations if r["dangerous"] and not r["ahead"]],
             "lc_requested": nominal_target != previous_target,
             "lc_decision": lc_decision,
         }
@@ -300,9 +376,25 @@ class ShieldedVehicle(MDPVehicle):
         self._last_act_clock = self.clock
         self._last_lc = (self.state["lc_requested"], self.state["lc_decision"])
 
+    def _needs_emergency(self, relations):
+        """Не хватит ли a_min_brake хотя бы для одной опасной машины впереди."""
+        p = self.params
+        v_e = max(0.0, velocity_in_lane(self, self.lane)[0])
+        for r in relations:
+            if not (r["dangerous"] and r["ahead"]):
+                continue
+            b_front = max(p.a_max_brake, -getattr(r["vehicle"], "a_prev", 0.0))
+            if brake_insufficient(r["long_gap"], v_e, max(0.0, r["v_long"]), self.a_prev,
+                                  b_front, p.a_min_brake):
+                return True
+        return False
+
     def step(self, dt):
         if not self.crashed:
+            a = limit_jerk(self.action["acceleration"], self.a_prev, dt)
             # задом не едем: на последнем шаге торможения дотормаживаем до нуля
-            self.action["acceleration"] = max(self.action["acceleration"], -self.speed / dt)
+            self.action["acceleration"] = max(a, -self.speed / dt)
         super().step(dt)
+        self.a_prev = self.action["acceleration"]
+        self.state["a_applied"] = self.a_prev
         self.clock += dt

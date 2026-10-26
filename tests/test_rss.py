@@ -95,7 +95,12 @@ def simulate_longitudinal(gap0, v_rear, v_front, p=DEFAULT, front_brake=None):
     vr, vf = float(v_rear), float(v_front)
     t, min_gap = 0.0, gap0
     while vr > 0 or vf > 0 or t < p.rho:
-        a_r = p.a_max_accel if t < p.rho else -p.a_min_brake
+        if t < p.rho:
+            a_r = p.a_max_accel
+        elif p.jerk is None:
+            a_r = -p.a_min_brake
+        else:  # переход от разгона к торможению с рывком p.jerk
+            a_r = max(-p.a_min_brake, p.a_max_accel - p.jerk * (t - p.rho))
         a_f = -front_brake
         # точное перемещение за шаг с остановкой на нуле скорости
         for_rear = vr * DT + 0.5 * a_r * DT**2
@@ -181,6 +186,59 @@ def test_lateral_dmin_is_enough_and_tight(v1, v2):
     if d > DEFAULT.mu:
         # без запаса μ машины сошлись бы ровно впритык
         assert min_gap == pytest.approx(DEFAULT.mu, abs=TOL)
+
+
+# ---------- 3. вариант леммы 2 с учетом рывка ----------
+
+JERK = RSSParams(jerk=10.0)
+
+
+def test_jerk_variant_both_stopped_hand_example():
+    # ρ-фаза: 3·0,5²/2 = 0,375 м, скорость 1,5 м/с.
+    # Переход +3 -> -4 за τ = 0,7 с (машина за это время не останавливается):
+    #   x(τ) = 1,5·0,7 + 3·0,49/2 − 10·0,343/6 = 1,05 + 0,735 − 0,57167 = 1,21333
+    #   v(τ) = 1,5 + 2,1 − 2,45 = 1,15;  дальше 1,15² / 8 = 0,16531
+    # итого 0,375 + 1,21333 + 0,16531 = 1,75365 (лемма 2 без рывка: 0,65625)
+    assert d_min_longitudinal(0, 0, JERK) == pytest.approx(1.7536458, abs=1e-6)
+
+
+def test_jerk_variant_equal_speeds_25_hand_example():
+    # v = 25 + 1,5 = 26,5 после ρ; x(τ) = 26,5·0,7 + 0,735 − 0,57167 = 18,71333
+    # v(τ) = 26,5 − 0,35 = 26,15; 26,15² / 8 = 85,47781
+    # задняя: 12,875 + 18,71333 + 85,47781 = 117,06615; передняя 62,5 -> 54,56615
+    assert d_min_longitudinal(25, 25, JERK) == pytest.approx(54.566146, abs=1e-5)
+
+
+def test_jerk_variant_infinite_jerk_is_lemma_2():
+    for v_r, v_f in SPEED_PAIRS:
+        assert d_min_longitudinal(v_r, v_f, RSSParams(jerk=1e9)) == pytest.approx(
+            d_min_longitudinal(v_r, v_f), abs=1e-6)
+
+
+def test_jerk_variant_is_larger():
+    for v_r, v_f in SPEED_PAIRS:
+        assert d_min_longitudinal(v_r, v_f, JERK) >= d_min_longitudinal(v_r, v_f)
+
+
+@pytest.mark.parametrize("v_rear,v_front", SPEED_PAIRS)
+def test_jerk_variant_is_enough_and_tight(v_rear, v_front):
+    """Симуляция худшего случая с набором торможения по рывку: старт с d_min —
+    зазор доходит почти до нуля, но не меньше; старт чуть ближе — столкновение."""
+    d = d_min_longitudinal(v_rear, v_front, JERK)
+    assert simulate_longitudinal(d, v_rear, v_front, JERK) >= -TOL
+    if d > 1.0:
+        assert simulate_longitudinal(d, v_rear, v_front, JERK) == pytest.approx(0.0, abs=TOL)
+        assert simulate_longitudinal(d - 0.5, v_rear, v_front, JERK) < 0
+    # а d_min леммы 2 при рывке не хватает
+    if v_rear > 0 or v_front == 0:
+        assert simulate_longitudinal(d_min_longitudinal(v_rear, v_front), v_rear, v_front, JERK) < -TOL
+
+
+def test_jerk_variant_grid_never_collides():
+    for v_rear in range(0, 41, 5):
+        for v_front in range(0, 41, 5):
+            d = d_min_longitudinal(v_rear, v_front, JERK)
+            assert simulate_longitudinal(d, v_rear, v_front, JERK) >= -TOL, (v_rear, v_front)
 
 
 def test_custom_params_are_used():

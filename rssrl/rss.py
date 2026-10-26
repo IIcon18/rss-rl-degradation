@@ -5,6 +5,13 @@ Scalable Self-driving Cars. arXiv:1708.06374, 2017.
 - лемма 2 — продольная дистанция (машины едут в одну сторону друг за другом);
 - лемма 4 — поперечная дистанция (машины едут рядом в соседних полосах).
 
+Вариант леммы 2 с учетом рывка (RSSParams.jerk не None): после времени
+реакции задняя машина не может мгновенно перейти от разгона a_max_accel к
+торможению a_min_brake — ускорение меняется с рывком jerk, на это уходит
+(a_max_accel + a_min_brake) / jerk секунд (при 3, 4 и 10 м/с^3 — 0,7 с).
+Этот путь добавляется к пути задней машины. Передняя машина, как и в
+лемме, тормозит с a_max_brake сразу (худший случай для задней).
+
 Все величины в СИ: метры, секунды, м/с, м/с^2. Ускорения и торможения
 задаются положительными числами (модуль).
 Дистанция — это зазор между кузовами (от заднего бампера передней машины
@@ -32,6 +39,8 @@ class RSSParams:
     a_lat_min_brake: float = 0.8  # поперечное торможение до нулевой поперечной скорости
     mu: float = 0.1  # поперечный запас, м
 
+    jerk: float | None = None  # рывок задней машины, м/с^3; None — лемма 2 как в статье
+
 
 DEFAULT = RSSParams()
 
@@ -54,9 +63,31 @@ def d_min_longitudinal(v_rear, v_front, p=DEFAULT):
         raise ValueError("скорости в лемме 2 должны быть неотрицательными")
     rho, a_acc = p.rho, p.a_max_accel
     v_rear_rho = v_rear + rho * a_acc  # скорость задней в конце времени реакции
-    rear_path = v_rear * rho + 0.5 * a_acc * rho**2 + v_rear_rho**2 / (2 * p.a_min_brake)
+    if p.jerk is None:
+        rear_path = v_rear * rho + 0.5 * a_acc * rho**2 + v_rear_rho**2 / (2 * p.a_min_brake)
+    else:
+        rear_path = v_rear * rho + 0.5 * a_acc * rho**2 + _jerk_brake_path(v_rear_rho, a_acc, p.a_min_brake, p.jerk)
     front_path = v_front**2 / (2 * p.a_max_brake)
     return max(0.0, rear_path - front_path)
+
+
+def _jerk_brake_path(v, a0, b, j):
+    """Путь до остановки машины со скоростью v и ускорением a0 (> 0, разгон),
+    которая уменьшает ускорение с рывком j до -b и дальше тормозит с b.
+
+    Фаза перехода длится tau = (a0 + b) / j: a(t) = a0 - j t,
+    v(t) = v + a0 t - j t^2/2, x(t) = v t + a0 t^2/2 - j t^3/6.
+    Если машина останавливается еще во время перехода (v(t) = 0 раньше tau),
+    путь — x в момент остановки.
+    """
+    tau = (a0 + b) / j
+    t_stop = (a0 + (a0 * a0 + 2 * j * v) ** 0.5) / j  # корень v(t) = 0
+    if t_stop <= tau:
+        t = t_stop
+        return v * t + a0 * t * t / 2 - j * t**3 / 6
+    x_tau = v * tau + a0 * tau * tau / 2 - j * tau**3 / 6
+    v_tau = v + a0 * tau - j * tau * tau / 2
+    return x_tau + v_tau * v_tau / (2 * b)
 
 
 def _lateral_path(v, a_acc, a_brake, rho):

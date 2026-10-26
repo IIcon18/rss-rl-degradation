@@ -4,10 +4,15 @@ BoundedIDMVehicle — фоновая машина. Обычная IDM/MOBIL-ма
 но с двумя исправлениями, чтобы она соблюдала допущения RSS:
 - тормозит не сильнее a_max_brake = 5 м/с^2 (в highway-env обрезка 6 м/с^2);
 - не уезжает задом: скорость не опускается ниже нуля.
+Кроме того, ускорение меняется не быстрее J_MAX (rssrl/dynamics.py):
+IDM может «скакнуть» с +2 на −5 м/с^2 за шаг, настоящая машина — нет.
 
 BrakingViolator — нарушитель. До момента нарушения ведет себя как фоновая
 машина. В момент нарушения перестает слушать IDM и сам задает себе
 ускорение -β·a_max_brake, держит полосу и тормозит до полной остановки.
+Торможение набирается через предел рывка J_MAX: от текущего ускорения
+до -β·a_max_brake за (β·5 + a_текущее)/J_MAX секунд (при β = 2 и движении
+без ускорения — 1 с). Мгновенного скачка ускорения нет.
 После остановки стоит до конца эпизода (stay_stopped=True) или снова
 едет как фоновая машина (stay_stopped=False). Это важно: если лидер сразу
 трогается, догоняющий агент получает лишний запас дистанции.
@@ -15,14 +20,15 @@ BrakingViolator — нарушитель. До момента нарушения
 при β > 1 — нарушение допущения. Потолок β = 2 (10 м/с^2) — выбранный
 предел испытаний, а не физический закон.
 
-Каждое торможение логируется: заданное ускорение и фактическое, посчитанное
-по изменению скорости за шаг симуляции.
+Каждое торможение логируется: целевое ускорение (-β·5), выставленное на шаге
+(после предела рывка) и фактическое, посчитанное по изменению скорости.
 """
 
 import math
 
 from highway_env.vehicle.behavior import IDMVehicle
 
+from rssrl.dynamics import limit_jerk
 from rssrl.rss import DEFAULT
 
 
@@ -35,6 +41,7 @@ class BoundedIDMVehicle(IDMVehicle):
     """Фоновая машина: IDM/MOBIL с торможением не сильнее a_max_brake."""
 
     BRAKE_LIMIT = DEFAULT.a_max_brake  # м/с^2
+    a_prev = 0.0  # ускорение, исполненное на прошлом шаге, м/с^2
 
     def act(self, action=None):
         super().act(action)
@@ -43,8 +50,10 @@ class BoundedIDMVehicle(IDMVehicle):
 
     def step(self, dt):
         if not self.crashed:
-            self.action["acceleration"] = _no_reverse(self.action["acceleration"], self.speed, dt)
+            a = limit_jerk(self.action["acceleration"], self.a_prev, dt)
+            self.action["acceleration"] = _no_reverse(a, self.speed, dt)
         super().step(dt)
+        self.a_prev = self.action["acceleration"]
 
 
 class BrakingViolator(BoundedIDMVehicle):
@@ -90,6 +99,7 @@ class BrakingViolator(BoundedIDMVehicle):
             stay_stopped=stay_stopped,
         )
         new.DELTA = vehicle.DELTA  # характер, выпавший при генерации сцены
+        new.a_prev = getattr(vehicle, "a_prev", 0.0)  # ускорение не скачет при замене
         if hasattr(vehicle, "uid"):
             new.uid = vehicle.uid
         new.lane_index, new.lane = vehicle.lane_index, vehicle.lane
@@ -115,7 +125,7 @@ class BrakingViolator(BoundedIDMVehicle):
                 "a_commanded": self.commanded_acceleration,
                 "t": [],  # время каждого шага торможения
                 "speed": [],  # скорость в начале шага
-                "a_set": [],  # ускорение, выставленное на шаге
+                "a_set": [],  # ускорение, выставленное на шаге (после предела рывка)
                 "a_actual": [],  # (v_после - v_до) / dt
                 "lane": [],  # полоса на каждом шаге
                 "t_stop": None,
@@ -154,10 +164,12 @@ class BrakingViolator(BoundedIDMVehicle):
         event = self.events[-1]
         v_before = self.speed
         if not self.crashed:
-            # единственная поправка: на последнем шаге не уехать задом
-            self.action["acceleration"] = _no_reverse(self.commanded_acceleration, v_before, dt)
+            # к цели -β·5 через предел рывка; на последнем шаге не уехать задом
+            a = limit_jerk(self.commanded_acceleration, self.a_prev, dt)
+            self.action["acceleration"] = _no_reverse(a, v_before, dt)
         a_set = self.action["acceleration"]
         IDMVehicle.step(self, dt)  # без обрезки BoundedIDMVehicle
+        self.a_prev = self.action["acceleration"]
         event["t"].append(self.clock)
         event["speed"].append(v_before)
         event["a_set"].append(a_set)
@@ -192,12 +204,13 @@ class CutInViolator(BrakingViolator):
     по полиному 5-й степени, поэтому положение, поперечная скорость и
     поперечное ускорение непрерывны (никакой телепортации). Пиковая
     поперечная скорость 1.875·Δ/T (при Δ = 4 м, T = 3 с — 2.5 м/с).
-    Продольная скорость во время маневра постоянна.
+    Продольное ускорение во время маневра — 0 (до него — ускорение IDM,
+    переход через предел рывка).
 
     В момент пересечения разметки (середина маневра) вызывается on_cross —
     сцена измеряет там зазор до агента. Если brake_on_cross, нарушитель
-    сразу начинает тормозить с β·a_max_brake (при β = 1 — самое сильное
-    торможение, которое допускает RSS) и тормозит до остановки.
+    сразу начинает тормозить к β·a_max_brake (через предел рывка; при β = 1 —
+    самое сильное торможение, которое допускает RSS) и тормозит до остановки.
     """
 
     def __init__(self, *args, lc_duration=3.0, brake_on_cross=True, on_cross=None, **kwargs):
@@ -254,7 +267,9 @@ class CutInViolator(BrakingViolator):
         ay = dy_total * ddq / self.lc_duration**2
 
         vx = c["vx"]
-        a = _no_reverse(self.commanded_acceleration, vx, dt) if self.violating else 0.0
+        target = self.commanded_acceleration if self.violating else 0.0
+        a = _no_reverse(limit_jerk(target, self.a_prev, dt), vx, dt)
+        self.a_prev = a
         vx_new = max(0.0, vx + a * dt)
         c["s"] += (vx + vx_new) / 2 * dt
         y_old = self.cut["y"][-1] if self.cut["y"] else c["y0"]

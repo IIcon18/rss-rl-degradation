@@ -113,7 +113,7 @@ def test_idle_without_shield_needs_the_intervention(original):
 def test_braking_violator_beta_1_ends_in_stop():
     """β = 1: лидер тормозит до остановки и стоит; IDLE с фильтром
     останавливается за ним без столкновения — исход «остановка»."""
-    outcome, _ = _run_one((0, 1.0, True, 0.0), "brake", "idle")
+    outcome, _ = _run_one((0, 1.0, True, 0.0), "brake", "idle", trigger="schedule")
     assert outcome["triggered"]
     assert outcome["outcome"] == "stopped"
     assert outcome["t_standing"] >= STOP_DURATION
@@ -131,3 +131,16 @@ def test_counterfactual_window_extends_past_episode_end():
     assert cf_log["t"].iloc[-1] > 40 or cf_log["crashed"].any()
     n = int((log["t"] <= iv.t_start + 1e-9).sum())
     pd.testing.assert_series_equal(log["ego_x"].iloc[:n], cf_log["ego_x"].iloc[:n])
+
+
+def test_counterfactual_with_schedule_matches_original():
+    """Контрфакт для эпизода с нарушением по расписанию должен прогоняться
+    с тем же расписанием: до отключения фильтра — та же сцена."""
+    job = (2, 2.0, True, 0.5)
+    _, log = _run_one(job, "brake", "idle", trigger="schedule")
+    iv = interventions(log).iloc[-1]
+    _, cf_log = _run_one(job, "brake", "idle", shield_off_at=iv.t_start, t_stop=iv.t_end + 5,
+                         trigger="schedule")
+    n = int((log["t"] <= iv.t_start + 1e-9).sum())
+    pd.testing.assert_series_equal(log["ego_x"].iloc[:n], cf_log["ego_x"].iloc[:n])
+    assert log["vio_v"].first_valid_index() == cf_log["vio_v"].first_valid_index()

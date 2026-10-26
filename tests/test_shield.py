@@ -1,11 +1,14 @@
 """Этап 3: RSS-фильтр на нижнем уровне (rssrl/shield.py, rssrl/scenarios.py)."""
 
+import math
+
 import numpy as np
 import pytest
 
+from rssrl.dynamics import A_PHYS_BRAKE, J_MAX
 from rssrl.rss import DEFAULT, d_min_longitudinal
-from rssrl.scenarios import make_env, make_scene, run_episode
-from rssrl.shield import SIM_DT, ShieldedVehicle, find_front
+from rssrl.scenarios import make_env, make_scene, run_episode, violation_schedule
+from rssrl.shield import SHIELD_DEFAULT, SIM_DT, ShieldedVehicle, find_front
 from rssrl.violators import BoundedIDMVehicle
 
 LANE_W = 4.0  # ширина полосы highway-env, м
@@ -67,12 +70,13 @@ def test_no_intervention_when_safe():
 
 
 def test_brakes_at_least_a_min_brake_when_dangerous():
-    env, ego = empty_road_with_ego()
+    env, ego = empty_road_with_ego(reaction_delay=0.0)
     add_car(env, 30.0, 1, 25.0)  # зазор 25 м < d_min ≈ 38 м
     ego.act()
     assert ego.state["dangerous"] and ego.state["shield_active"]
     assert ego.state["a_executed"] <= -DEFAULT.a_min_brake
-    assert ego.state["d_min"] == pytest.approx(d_min_longitudinal(25.0, 25.0))
+    # фильтр по умолчанию считает d_min по лемме 2 с учетом рывка
+    assert ego.state["d_min"] == pytest.approx(d_min_longitudinal(25.0, 25.0, SHIELD_DEFAULT))
 
 
 def test_without_shield_same_check_but_no_intervention():
@@ -106,22 +110,48 @@ SEEDS = range(12)
 
 
 @pytest.mark.parametrize("delay", [0.0, DEFAULT.rho])
-def test_no_collisions_with_shield_when_assumption_holds(delay):
+def test_no_collisions_with_shield_when_assumption_holds(delay, monkeypatch):
     """β = 1 (лидер тормозит ровно с a_max_brake): с фильтром агент
-    не должен ни во что врезаться, при любой из двух задержек."""
+    не должен ни во что врезаться, при любой из двух задержек.
+
+    Вариант 1: d_min по лемме 2 как в статье — в условиях самой леммы, то
+    есть без предела рывка (лемма считает, что торможение начинается
+    мгновенно после ρ)."""
+    monkeypatch.setattr("rssrl.dynamics.J_MAX", math.inf)
     for seed in SEEDS:
-        outcome, _ = run_episode(make_scene(seed, beta=1.0, shield=True, reaction_delay=delay))
+        outcome, _ = run_episode(make_scene(seed, beta=1.0, shield=True, reaction_delay=delay, dmin="lemma2"))
         assert outcome["triggered"], seed
         assert not outcome["collision"], (seed, outcome["crash_partners"])
 
 
-def test_ego_physical_limits_respected():
+@pytest.mark.parametrize("delay", [0.0, DEFAULT.rho])
+def test_no_collisions_with_jerk_and_jerk_aware_dmin(delay):
+    """Главный критерий готовности: рывок 10 м/с^3 включен у всех машин,
+    фильтр считает d_min с учетом рывка (по умолчанию). При β = 1 столкновений
+    быть не должно ни при одной задержке. Нарушение — по расписанию, чтобы
+    оно наступало и у осторожного мгновенного фильтра."""
+    for seed in SEEDS:
+        sched = violation_schedule(seed)
+        outcome, _ = run_episode(make_scene(seed, beta=1.0, shield=True, reaction_delay=delay, schedule=sched))
+        assert outcome["triggered"], seed
+        assert not outcome["collision"], (seed, outcome["crash_partners"], outcome["v_impact"])
+
+
+@pytest.mark.parametrize("seed", [0, 3])
+def test_ego_physical_limits_respected(seed):
     for shield in [True, False]:
-        _, log = run_episode(make_scene(0, beta=2.0, shield=shield))
+        _, log = run_episode(make_scene(seed, beta=2.0, shield=shield))
         ok = log[~log["crashed"]]
         assert ok["ego_a"].max() <= DEFAULT.a_max_accel + 1e-9
-        assert ok["ego_a"].min() >= -DEFAULT.a_max_brake - 1e-9
+        # сильнее 5 м/с^2 тормозит только экстренный режим фильтра
+        floor = -A_PHYS_BRAKE if shield else -DEFAULT.a_max_brake
+        assert ok["ego_a"].min() >= floor - 1e-9
         assert ok["ego_v"].min() >= 0.0
+        # рывок: ускорение меняется не больше чем на J_MAX·dt за шаг
+        # (кроме дотормаживания до нуля перед остановкой)
+        jumps = ok["ego_a"].diff().abs()
+        stopping = (ok["ego_v"] < 0.5) | (ok["ego_v"].shift() < 0.5)
+        assert jumps[~stopping].max() <= J_MAX * SIM_DT + 1e-9
 
 
 def test_scene_identical_until_violation_for_all_betas():

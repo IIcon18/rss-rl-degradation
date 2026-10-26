@@ -2,25 +2,42 @@
 
 import math
 from concurrent.futures import ProcessPoolExecutor
+from functools import lru_cache, partial
 from itertools import product
 
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-from rssrl.scenarios import make_scene, run_episode
+from rssrl.scenarios import make_scene, run_episode, violation_schedule
 
 RANDOM_POLICY_SEED_OFFSET = 1000  # seed случайной политики = seed сцены + 1000
 
 
-def _make(job, kind, **config):
+@lru_cache(maxsize=None)
+def _schedule(seed, kind, gamma):
+    """Расписание нарушения из эталонного прогона (кэш в процессе)."""
+    return violation_schedule(seed, kind=kind, gamma=gamma)
+
+
+def _make(job, kind, trigger="gap", dmin="jerk", **config):
+    """trigger="gap" — нарушение по условию на зазор (момент зависит от агента),
+    "schedule" — по расписанию из эталонного прогона (одинаково для всех
+    вариантов агента; эталон — IDLE с фильтром и задержкой ρ)."""
     seed, level, shield, delay = job
     if kind == "brake":
-        return make_scene(seed, beta=level, shield=shield, reaction_delay=delay, **config)
+        sched = _schedule(seed, "brake", 1.0) if trigger == "schedule" else None
+        if trigger == "schedule" and sched is None:
+            sched = {"t": math.inf, "uid": -1}
+        return make_scene(seed, beta=level, shield=shield, reaction_delay=delay, schedule=sched, dmin=dmin, **config)
     if kind == "cutin":  # уровень — γ, β = 1
-        return make_scene(seed, shield=shield, reaction_delay=delay, kind="cutin", gamma=level, **config)
+        sched = _schedule(seed, "cutin", level) if trigger == "schedule" else None
+        if trigger == "schedule" and sched is None:
+            sched = {"t": math.inf, "uid": -1, "lane": None}
+        return make_scene(seed, shield=shield, reaction_delay=delay, kind="cutin", gamma=level,
+                          schedule=sched, dmin=dmin, **config)
     # nominal: нарушителя нет, уровень не используется (передавайте [1.0])
-    return make_scene(seed, shield=shield, reaction_delay=delay, kind="nominal", **config)
+    return make_scene(seed, shield=shield, reaction_delay=delay, kind="nominal", dmin=dmin, **config)
 
 
 def _policy(seed, policy):
@@ -33,8 +50,8 @@ def _policy(seed, policy):
     return None  # IDLE
 
 
-def _run_one(job, kind, policy, shield_off_at=None, t_stop=None, **config):
-    scene = _make(job, kind, **config)
+def _run_one(job, kind, policy, shield_off_at=None, t_stop=None, trigger="gap", dmin="jerk", **config):
+    scene = _make(job, kind, trigger=trigger, dmin=dmin, **config)
     if shield_off_at is not None:
         scene.ego.shield_off_at = shield_off_at
     outcome, log = run_episode(scene, policy=_policy(job[0], policy), t_stop=t_stop)
@@ -45,13 +62,15 @@ def _run_one(job, kind, policy, shield_off_at=None, t_stop=None, **config):
     return outcome, log
 
 
-def run_grid(seeds, levels, variants, kind="brake", policy="idle", processes=None):
+def run_grid(seeds, levels, variants, kind="brake", policy="idle", processes=None, trigger="gap", dmin="jerk"):
     """Прогнать все сочетания seed × уровень × вариант.
 
     levels — значения β (kind="brake") или γ (kind="cutin", β = 1).
     variants — список пар (shield, reaction_delay).
     policy — "idle" (постоянная скорость, пилот без PPO) или "random"
     (случайные действия, проверка запрета перестроений).
+    trigger — "gap" (нарушение по зазору) или "schedule" (по расписанию).
+    dmin — формула d_min в фильтре: "jerk" (с учетом рывка) или "lemma2".
     Возвращает (таблица исходов, словарь логов по ключу (seed, уровень, shield, delay)).
     Результат не зависит от числа процессов: каждый эпизод определяется
     только своим seed сцены (и seed политики).
@@ -59,7 +78,7 @@ def run_grid(seeds, levels, variants, kind="brake", policy="idle", processes=Non
     jobs = [(s, b, sh, d) for s, b, (sh, d) in product(seeds, levels, variants)]
     n = len(jobs)
     with ProcessPoolExecutor(processes) as pool:
-        results = list(pool.map(_run_one, jobs, [kind] * n, [policy] * n))
+        results = list(pool.map(partial(_run_one, trigger=trigger, dmin=dmin), jobs, [kind] * n, [policy] * n))
     outcomes = pd.DataFrame([o for o, _ in results])
     logs = {job: log for job, (_, log) in zip(jobs, results)}
     return outcomes, logs
@@ -100,7 +119,7 @@ def interventions(log, merge_gap=MERGE_GAP, dt=1 / 15):
     return pd.DataFrame(out, columns=["t_start", "t_end", "brake_steps", "lc_steps"])
 
 
-def counterfactual(job, kind, policy, t_start, t_end, horizon=CF_HORIZON):
+def counterfactual(job, kind, policy, t_start, t_end, horizon=CF_HORIZON, trigger="gap"):
     """Тот же эпизод (та же сцена, та же политика), но с момента t_start
     фильтр не вмешивается. Едем до t_end + horizon и смотрим, будет ли
     столкновение. До t_start прогон совпадает с исходным: сцена
@@ -108,11 +127,14 @@ def counterfactual(job, kind, policy, t_start, t_end, horizon=CF_HORIZON):
     лимит времени среды продлевается до конца окна, иначе вмешательства в
     конце эпизода выглядели бы «лишними» только из-за обрезанного окна
     (расстановка машин от длительности эпизода не зависит).
+    trigger — как в исходном прогоне ("gap" или "schedule"), иначе сцена
+    до t_start не совпадет с исходной.
     Возвращает словарь: collision (в пределах окна), t_crash, crash_partners, min_gap.
     """
     t_window = t_end + horizon
     duration = max(DURATION, math.ceil(t_window + 1e-9))
-    outcome, log = _run_one(job, kind, policy, shield_off_at=t_start, t_stop=t_window, duration=duration)
+    outcome, log = _run_one(job, kind, policy, shield_off_at=t_start, t_stop=t_window, trigger=trigger,
+                            duration=duration)
     after = log[log["t"] > t_start]
     hit = outcome["collision"] and outcome["t_crash"] <= t_window + 1e-9
     return {
@@ -124,11 +146,11 @@ def counterfactual(job, kind, policy, t_start, t_end, horizon=CF_HORIZON):
 
 
 def _cf_one(task):
-    job, kind, policy, iv = task
-    return {**iv, **counterfactual(job, kind, policy, iv["t_start"], iv["t_end"])}
+    job, kind, policy, iv, trigger = task
+    return {**iv, **counterfactual(job, kind, policy, iv["t_start"], iv["t_end"], trigger=trigger)}
 
 
-def counterfactual_grid(logs, kind="brake", policy="idle", processes=None):
+def counterfactual_grid(logs, kind="brake", policy="idle", processes=None, trigger="gap"):
     """Для каждого вмешательства фильтра во всех эпизодах с фильтром —
     контрфактический прогон без вмешательства (параллельно).
 
@@ -142,7 +164,7 @@ def counterfactual_grid(logs, kind="brake", policy="idle", processes=None):
             continue
         for iv in interventions(log).to_dict("records"):
             iv.update(seed=job[0], level=job[1], shield=job[2], reaction_delay=job[3])
-            tasks.append((job, kind, policy, iv))
+            tasks.append((job, kind, policy, iv, trigger))
     with ProcessPoolExecutor(processes) as pool:
         rows = list(pool.map(_cf_one, tasks))
     df = pd.DataFrame(rows)
@@ -186,16 +208,20 @@ def unsafe_entries(log, settle=3.0, dt=1 / 15):
 
 def plot_episode(log, title="", axes=None, lateral=False):
     """Панели: зазор и d_min; скорости; ускорения; при lateral=True еще
-    поперечное положение нарушителя. Серым — фильтр тормозит."""
+    поперечное положение нарушителя. Светло-серым — фильтр тормозит,
+    темно-серым — экстренное торможение."""
     if axes is None:
         _, axes = plt.subplots(4 if lateral else 3, 1, figsize=(8, 9 if lateral else 7), sharex=True)
     t = log["t"]
     active = log["shield_active"].astype(bool)
     t_vio = log.loc[log["vio_v"].notna(), "t"].min() if "vio_v" in log else None
 
+    emergency = (log["shield_mode"] == "emergency") if "shield_mode" in log else active & False
     for ax in axes:
         ax.fill_between(t, 0, 1, where=active, transform=ax.get_xaxis_transform(),
                         color="0.85", step="post", linewidth=0)
+        ax.fill_between(t, 0, 1, where=emergency, transform=ax.get_xaxis_transform(),
+                        color="0.65", step="post", linewidth=0)
         if t_vio is not None and pd.notna(t_vio):
             ax.axvline(t_vio, color="#c0392b", linewidth=1, linestyle=":")
         if log["crashed"].any():
@@ -223,8 +249,8 @@ def plot_episode(log, title="", axes=None, lateral=False):
     if "vio_a" in log:
         ax.plot(t, log["vio_a"], color="#c0392b", label="нарушитель, фактически")
     ax.set_ylabel("ускорение, м/с²")
-    ax.set_xlabel("время, с (серое — фильтр тормозит, пунктир — начало нарушения, "
-                  "черная линия — столкновение)")
+    ax.set_xlabel("время, с\nсерое — фильтр тормозит (темнее — экстренно); пунктир — "
+                  "начало нарушения; черная линия — столкновение")
     ax.legend(loc="lower right", fontsize=8, frameon=False)
     if lateral:
         ax.set_xlabel("")
@@ -233,8 +259,8 @@ def plot_episode(log, title="", axes=None, lateral=False):
         for y in (-2, 2):
             ax.axhline(y, color="0.5", linewidth=1, linestyle="--")
         ax.set_ylabel("поперек, м")
-        ax.set_xlabel("время, с (серое — фильтр тормозит, пунктир — начало нарушения, "
-                      "черная линия — столкновение; штрихи — разметка)")
+        ax.set_xlabel("время, с\nсерое — фильтр тормозит (темнее — экстренно); пунктир — "
+                      "начало нарушения;\nчерная линия — столкновение; штрихи — разметка")
         ax.legend(loc="upper right", fontsize=8, frameon=False)
     for a in axes:
         a.grid(alpha=0.3)
