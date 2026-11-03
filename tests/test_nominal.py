@@ -36,10 +36,10 @@ def test_episodes_run_to_time_limit_and_agent_keeps_moving(nominal):
 def test_shield_commands_stay_within_physical_limits(nominal):
     _, logs = nominal
     for log in logs.values():
-        # сильнее 5 м/с^2 — только экстренный режим фильтра, до A_PHYS_BRAKE
-        assert log["ego_a"].min() >= -A_PHYS_BRAKE - 1e-6
-        if (log["ego_a"] < -5.0 - 1e-6).any():
-            assert (log["shield_mode"] == "emergency").any()
+        # базовая реакция (по умолчанию) не тормозит сильнее 5 м/с^2 и не
+        # переходит в аварийный режим
+        assert log["ego_a"].min() >= -5.0 - 1e-6 > -A_PHYS_BRAKE
+        assert not (log["shield_mode"] == "emergency").any()
         assert log["ego_a"].max() <= 3.0 + 1e-6
 
 

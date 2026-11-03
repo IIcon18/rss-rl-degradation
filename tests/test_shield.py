@@ -143,15 +143,25 @@ def test_ego_physical_limits_respected(seed):
         _, log = run_episode(make_scene(seed, beta=2.0, shield=shield))
         ok = log[~log["crashed"]]
         assert ok["ego_a"].max() <= DEFAULT.a_max_accel + 1e-9
-        # сильнее 5 м/с^2 тормозит только экстренный режим фильтра
-        floor = -A_PHYS_BRAKE if shield else -DEFAULT.a_max_brake
-        assert ok["ego_a"].min() >= floor - 1e-9
+        # базовая реакция (по умолчанию) тормозит не сильнее 5 м/с^2
+        assert ok["ego_a"].min() >= -DEFAULT.a_max_brake - 1e-9
         assert ok["ego_v"].min() >= 0.0
         # рывок: ускорение меняется не больше чем на J_MAX·dt за шаг
         # (кроме дотормаживания до нуля перед остановкой)
         jumps = ok["ego_a"].diff().abs()
         stopping = (ok["ego_v"] < 0.5) | (ok["ego_v"].shift() < 0.5)
         assert jumps[~stopping].max() <= J_MAX * SIM_DT + 1e-9
+
+
+@pytest.mark.parametrize("seed", [0, 3])
+def test_emergency_variant_physical_limits(seed):
+    """Вариант с аварийным торможением: сильнее 5 м/с^2 — только в режиме
+    "emergency" и не сильнее A_PHYS_BRAKE."""
+    _, log = run_episode(make_scene(seed, beta=2.0, shield=True, emergency_brake=True))
+    ok = log[~log["crashed"]]
+    assert ok["ego_a"].min() >= -A_PHYS_BRAKE - 1e-9
+    hard = ok["ego_a"] < -DEFAULT.a_max_brake - 1e-9
+    assert (ok.loc[hard, "shield_mode"] == "emergency").all()
 
 
 def test_scene_identical_until_violation_for_all_betas():

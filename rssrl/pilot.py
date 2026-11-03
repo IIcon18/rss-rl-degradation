@@ -62,7 +62,8 @@ def _run_one(job, kind, policy, shield_off_at=None, t_stop=None, trigger="gap", 
     return outcome, log
 
 
-def run_grid(seeds, levels, variants, kind="brake", policy="idle", processes=None, trigger="gap", dmin="jerk"):
+def run_grid(seeds, levels, variants, kind="brake", policy="idle", processes=None, trigger="gap", dmin="jerk",
+             emergency_brake=False):
     """Прогнать все сочетания seed × уровень × вариант.
 
     levels — значения β (kind="brake") или γ (kind="cutin", β = 1).
@@ -71,6 +72,8 @@ def run_grid(seeds, levels, variants, kind="brake", policy="idle", processes=Non
     (случайные действия, проверка запрета перестроений).
     trigger — "gap" (нарушение по зазору) или "schedule" (по расписанию).
     dmin — формула d_min в фильтре: "jerk" (с учетом рывка) или "lemma2".
+    emergency_brake — False: базовая надлежащая реакция (основной вариант),
+    True: тот же фильтр с дополнительным аварийным торможением.
     Возвращает (таблица исходов, словарь логов по ключу (seed, уровень, shield, delay)).
     Результат не зависит от числа процессов: каждый эпизод определяется
     только своим seed сцены (и seed политики).
@@ -78,7 +81,8 @@ def run_grid(seeds, levels, variants, kind="brake", policy="idle", processes=Non
     jobs = [(s, b, sh, d) for s, b, (sh, d) in product(seeds, levels, variants)]
     n = len(jobs)
     with ProcessPoolExecutor(processes) as pool:
-        results = list(pool.map(partial(_run_one, trigger=trigger, dmin=dmin), jobs, [kind] * n, [policy] * n))
+        run = partial(_run_one, trigger=trigger, dmin=dmin, emergency_brake=emergency_brake)
+        results = list(pool.map(run, jobs, [kind] * n, [policy] * n))
     outcomes = pd.DataFrame([o for o, _ in results])
     logs = {job: log for job, (_, log) in zip(jobs, results)}
     return outcomes, logs
@@ -119,7 +123,7 @@ def interventions(log, merge_gap=MERGE_GAP, dt=1 / 15):
     return pd.DataFrame(out, columns=["t_start", "t_end", "brake_steps", "lc_steps"])
 
 
-def counterfactual(job, kind, policy, t_start, t_end, horizon=CF_HORIZON, trigger="gap"):
+def counterfactual(job, kind, policy, t_start, t_end, horizon=CF_HORIZON, trigger="gap", **config):
     """Тот же эпизод (та же сцена, та же политика), но с момента t_start
     фильтр не вмешивается. Едем до t_end + horizon и смотрим, будет ли
     столкновение. До t_start прогон совпадает с исходным: сцена
@@ -128,13 +132,14 @@ def counterfactual(job, kind, policy, t_start, t_end, horizon=CF_HORIZON, trigge
     конце эпизода выглядели бы «лишними» только из-за обрезанного окна
     (расстановка машин от длительности эпизода не зависит).
     trigger — как в исходном прогоне ("gap" или "schedule"), иначе сцена
-    до t_start не совпадет с исходной.
+    до t_start не совпадет с исходной. config — остальные параметры сцены
+    исходного прогона (например emergency_brake).
     Возвращает словарь: collision (в пределах окна), t_crash, crash_partners, min_gap.
     """
     t_window = t_end + horizon
     duration = max(DURATION, math.ceil(t_window + 1e-9))
     outcome, log = _run_one(job, kind, policy, shield_off_at=t_start, t_stop=t_window, trigger=trigger,
-                            duration=duration)
+                            duration=duration, **config)
     after = log[log["t"] > t_start]
     hit = outcome["collision"] and outcome["t_crash"] <= t_window + 1e-9
     return {
@@ -146,11 +151,11 @@ def counterfactual(job, kind, policy, t_start, t_end, horizon=CF_HORIZON, trigge
 
 
 def _cf_one(task):
-    job, kind, policy, iv, trigger = task
-    return {**iv, **counterfactual(job, kind, policy, iv["t_start"], iv["t_end"], trigger=trigger)}
+    job, kind, policy, iv, trigger, config = task
+    return {**iv, **counterfactual(job, kind, policy, iv["t_start"], iv["t_end"], trigger=trigger, **config)}
 
 
-def counterfactual_grid(logs, kind="brake", policy="idle", processes=None, trigger="gap"):
+def counterfactual_grid(logs, kind="brake", policy="idle", processes=None, trigger="gap", **config):
     """Для каждого вмешательства фильтра во всех эпизодах с фильтром —
     контрфактический прогон без вмешательства (параллельно).
 
@@ -164,7 +169,7 @@ def counterfactual_grid(logs, kind="brake", policy="idle", processes=None, trigg
             continue
         for iv in interventions(log).to_dict("records"):
             iv.update(seed=job[0], level=job[1], shield=job[2], reaction_delay=job[3])
-            tasks.append((job, kind, policy, iv, trigger))
+            tasks.append((job, kind, policy, iv, trigger, config))
     with ProcessPoolExecutor(processes) as pool:
         rows = list(pool.map(_cf_one, tasks))
     df = pd.DataFrame(rows)

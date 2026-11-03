@@ -99,7 +99,7 @@ def test_mode_brake_when_a_min_brake_is_enough():
 
 
 def test_mode_emergency_when_a_min_brake_is_not_enough():
-    env, ego = road_with_ego(reaction_delay=0.0)
+    env, ego = road_with_ego(reaction_delay=0.0, emergency_brake=True)
     add_car(env, 30.0, 0.0)  # стоящая машина в 25 м: при 4 м/с^2 нужно 78 м
     ego.act()
     assert ego.state["shield_mode"] == "emergency"
@@ -107,7 +107,7 @@ def test_mode_emergency_when_a_min_brake_is_not_enough():
 
 
 def test_emergency_is_held_until_danger_ends():
-    env, ego = road_with_ego(reaction_delay=0.0)
+    env, ego = road_with_ego(reaction_delay=0.0, emergency_brake=True)
     car = add_car(env, 30.0, 0.0)
     modes = []
     for _ in range(5):
@@ -132,6 +132,54 @@ def test_mode_delay_during_reaction_time():
         ego.step(SIM_DT)
     assert modes[:6] == ["delay"] * 6
     assert modes[6] in ("brake", "emergency")
+
+
+def test_base_variant_never_brakes_harder_than_a_max_brake():
+    """Базовая реакция (по умолчанию): даже когда a_min_brake не хватает,
+    аварийного торможения нет — команда -a_min_brake, режим "brake"."""
+    env, ego = road_with_ego(reaction_delay=0.0)
+    assert not ego.emergency_brake
+    add_car(env, 30.0, 0.0)
+    for _ in range(10):  # пока агент не доехал до машины (столкновения тут не проверяются)
+        ego.act()
+        assert ego.state["shield_mode"] == "brake"
+        assert ego.state["a_executed"] == pytest.approx(-DEFAULT.a_min_brake)
+        ego.step(SIM_DT)
+        assert ego.state["a_applied"] >= -DEFAULT.a_min_brake - 1e-9
+    assert not ego.emergency
+
+
+def test_base_variant_control_law_timeline():
+    """Закон управления базового варианта по шагам: опасность с первого шага,
+    задержка ρ — 7 шагов команды политики, на 8-м — команда -a_min_brake;
+    фактическое ускорение доходит до -a_min_brake с рывком J_MAX
+    (от 0 до -4 — 6 шагов); скорость не уходит в минус; после исчезновения
+    опасности команда снова политики, а ускорение возвращается с рывком."""
+    env, ego = road_with_ego(speed=10.0, reaction_delay=DEFAULT.rho)
+    car = add_car(env, 20.0, 10.0)  # зазор 15 м < d_min, обе 10 м/с
+    ego.last_safe = ego.clock - SIM_DT  # прошлый шаг был безопасным
+    cmd, applied, v = [], [], []
+    for _ in range(200):
+        ego.act("IDLE" if not cmd else None)
+        cmd.append(ego.state["a_executed"])
+        ego.step(SIM_DT)
+        applied.append(ego.state["a_applied"])
+        v.append(ego.speed)
+        car.speed = 10.0  # передняя едет ровно
+    k = next(i for i, a in enumerate(cmd) if a <= -DEFAULT.a_min_brake + 1e-9)
+    assert k == 6  # 7-й шаг: (k+1)·dt = 0,467 <= ρ < 0,533
+    reached = next(i for i, a in enumerate(applied) if a <= -DEFAULT.a_min_brake + 1e-9)
+    assert reached > k  # фактическое торможение отстает от команды
+    assert min(v) >= 0.0
+    for a0, a1 in zip(applied, applied[1:]):
+        assert abs(a1 - a0) <= J_MAX * SIM_DT + 1e-9 or v[applied.index(a1)] < 1.0
+    # отстали на безопасный зазор — фильтр отпускает
+    car.position[0] = 500.0
+    ego.act()
+    assert ego.state["shield_mode"] is None and ego.state["a_executed"] > -DEFAULT.a_min_brake
+    a_before = ego.a_prev
+    ego.step(SIM_DT)
+    assert abs(ego.a_prev - a_before) <= J_MAX * SIM_DT + 1e-9
 
 
 def test_default_reaction_delay_is_rho():

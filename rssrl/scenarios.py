@@ -244,7 +244,7 @@ class Scene:
 
 
 def make_scene(seed, beta=1.0, shield=True, reaction_delay=RHO, kind="brake", gamma=1.0,
-               t_min=TRIGGER_T_MIN, schedule=None, dmin="jerk", **config):
+               t_min=TRIGGER_T_MIN, schedule=None, dmin="jerk", emergency_brake=False, **config):
     """Сцена эксперимента.
 
     - агент: ShieldedVehicle с фильтром (shield=True) или без,
@@ -257,6 +257,9 @@ def make_scene(seed, beta=1.0, shield=True, reaction_delay=RHO, kind="brake", ga
       Чтобы было куда подрезать, на старте из полосы агента убираются машины
       на CUTIN_FREE_AHEAD м вперед (одинаково для всех вариантов агента и всех γ);
     - kind="nominal": нарушителя нет (проверка номинального режима);
+    - emergency_brake — вариант фильтра: False — базовая надлежащая реакция
+      с учетом рывка (основной), True — тот же фильтр с дополнительным
+      аварийным торможением до 8 м/с^2 (сравнение);
     - dmin — формула d_min в фильтре: "jerk" (по умолчанию, лемма 2 с учетом
       рывка) или "lemma2" (как в статье);
     - schedule — нарушение по расписанию (см. ViolationDirector и
@@ -268,7 +271,8 @@ def make_scene(seed, beta=1.0, shield=True, reaction_delay=RHO, kind="brake", ga
         v.uid = i  # постоянные номера машин для логов
 
     params = {"jerk": SHIELD_DEFAULT, "lemma2": LEMMA2}[dmin]
-    ego = ShieldedVehicle.replace(u.vehicle, shield_enabled=shield, reaction_delay=reaction_delay, params=params)
+    ego = ShieldedVehicle.replace(u.vehicle, shield_enabled=shield, reaction_delay=reaction_delay, params=params,
+                                  emergency_brake=emergency_brake)
     ego.uid = 0
     u.vehicle = ego
     if kind == "cutin":
@@ -393,6 +397,7 @@ def run_episode(scene, policy=None, t_stop=None):
         "t_brake": events[0]["t_start"] if events else None,
         "scheduled": scene.director.schedule is not None,
         "dmin": "jerk" if scene.ego.params.jerk is not None else "lemma2",
+        "emergency_brake": scene.ego.emergency_brake,
         "shield_steps": int(log["shield_active"].sum()),
         **scene.director.info,
     }
