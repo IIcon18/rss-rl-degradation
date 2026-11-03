@@ -3,6 +3,9 @@
 make_env    — среда с фоновыми машинами BoundedIDMVehicle;
 make_scene  — сцена эксперимента: агент (с фильтром или без), нарушитель
               (тормозящий лидер или подрезающий из соседней полосы), логгер;
+              фон — контролируемое следование (traffic="following", основной
+              β-сценарий, rssrl/traffic.py) или прежний фон highway-env с
+              MOBIL (traffic="robustness", испытание устойчивости);
 run_episode — прогон эпизода и его исход.
 
 Все случайности сцены задаются seed сцены. Одна и та же сцена (seed)
@@ -18,6 +21,7 @@ import highway_env  # noqa: F401  регистрирует highway-v0
 from rssrl.logger import EpisodeLogger
 from rssrl.rss import DEFAULT, d_min_longitudinal
 from rssrl.shield import LEMMA2, SHIELD_DEFAULT, ShieldedVehicle, longitudinal_speed, neighbours, relation
+from rssrl.traffic import place_following
 from rssrl.violators import BrakingViolator, CutInViolator
 
 BACKGROUND = "rssrl.violators.BoundedIDMVehicle"
@@ -237,6 +241,7 @@ class Scene:
     gamma: float
     shield: bool
     reaction_delay: float
+    traffic: str = "following"
 
     @property
     def violator(self):
@@ -244,7 +249,8 @@ class Scene:
 
 
 def make_scene(seed, beta=1.0, shield=True, reaction_delay=RHO, kind="brake", gamma=1.0,
-               t_min=TRIGGER_T_MIN, schedule=None, dmin="jerk", emergency_brake=False, **config):
+               t_min=TRIGGER_T_MIN, schedule=None, dmin="jerk", emergency_brake=False, traffic="following",
+               **config):
     """Сцена эксперимента.
 
     - агент: ShieldedVehicle с фильтром (shield=True) или без,
@@ -257,6 +263,12 @@ def make_scene(seed, beta=1.0, shield=True, reaction_delay=RHO, kind="brake", ga
       Чтобы было куда подрезать, на старте из полосы агента убираются машины
       на CUTIN_FREE_AHEAD м вперед (одинаково для всех вариантов агента и всех γ);
     - kind="nominal": нарушителя нет (проверка номинального режима);
+    - traffic — фон: "following" (по умолчанию, основной β-сценарий):
+      контролируемое следование, фон не перестраивается и держит d_min,
+      начальные зазоры >= d_min по правилу от seed (rssrl/traffic.py);
+      "robustness": прежний фон highway-env с MOBIL и случайной
+      расстановкой — отдельное испытание устойчивости, в нем допущения RSS
+      о других машинах не гарантированы;
     - emergency_brake — вариант фильтра: False — базовая надлежащая реакция
       с учетом рывка (основной), True — тот же фильтр с дополнительным
       аварийным торможением до 8 м/с^2 (сравнение);
@@ -267,6 +279,10 @@ def make_scene(seed, beta=1.0, shield=True, reaction_delay=RHO, kind="brake", ga
     """
     env = make_env(seed, **config)
     u = env.unwrapped
+    if traffic == "following":
+        place_following(u.road, u.vehicle, seed)
+    elif traffic != "robustness":
+        raise ValueError(traffic)
     for i, v in enumerate(u.road.vehicles):
         v.uid = i  # постоянные номера машин для логов
 
@@ -293,7 +309,7 @@ def make_scene(seed, beta=1.0, shield=True, reaction_delay=RHO, kind="brake", ga
         director = NoViolationDirector(env, ego, logger, beta, t_min)
     else:
         raise ValueError(kind)
-    return Scene(env, ego, director, logger, seed, kind, beta, gamma, shield, reaction_delay)
+    return Scene(env, ego, director, logger, seed, kind, beta, gamma, shield, reaction_delay, traffic)
 
 
 def violation_schedule(seed, kind="brake", gamma=1.0, shield=True, reaction_delay=RHO,
@@ -376,6 +392,7 @@ def run_episode(scene, policy=None, t_stop=None):
     outcome = {
         "seed": scene.seed,
         "kind": scene.kind,
+        "traffic": scene.traffic,
         "beta": scene.beta,
         "gamma": scene.gamma,
         "shield": scene.shield,
