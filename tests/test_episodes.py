@@ -6,6 +6,7 @@ import pytest
 
 from rssrl.pilot import _run_one, counterfactual, interventions
 from rssrl.scenarios import STOP_DURATION, classify_outcome
+from rssrl.schedules import build_schedules, save_schedules
 
 DT = 1 / 15
 
@@ -110,10 +111,16 @@ def test_idle_without_shield_needs_the_intervention(original):
     assert cf["collision"]
 
 
-def test_braking_violator_beta_1_ends_in_stop():
+@pytest.fixture(scope="module")
+def sched_file(tmp_path_factory):
+    """Расписания эталона для сцен 0 и 2 во временном файле."""
+    return save_schedules(build_schedules([0, 2]), tmp_path_factory.mktemp("s") / "schedules.csv")
+
+
+def test_braking_violator_beta_1_ends_in_stop(sched_file):
     """β = 1: лидер тормозит до остановки и стоит; IDLE с фильтром
     останавливается за ним без столкновения — исход «остановка»."""
-    outcome, _ = _run_one((0, 1.0, True, 0.0), "brake", "idle", trigger="schedule")
+    outcome, _ = _run_one((0, 1.0, True, 0.0), "brake", "idle", trigger="schedule", schedule_file=sched_file)
     assert outcome["triggered"]
     assert outcome["outcome"] == "stopped"
     assert outcome["t_standing"] >= STOP_DURATION
@@ -133,14 +140,14 @@ def test_counterfactual_window_extends_past_episode_end():
     pd.testing.assert_series_equal(log["ego_x"].iloc[:n], cf_log["ego_x"].iloc[:n])
 
 
-def test_counterfactual_with_schedule_matches_original():
+def test_counterfactual_with_schedule_matches_original(sched_file):
     """Контрфакт для эпизода с нарушением по расписанию должен прогоняться
     с тем же расписанием: до отключения фильтра — та же сцена."""
     job = (2, 2.0, True, 0.5)
-    _, log = _run_one(job, "brake", "idle", trigger="schedule")
+    _, log = _run_one(job, "brake", "idle", trigger="schedule", schedule_file=sched_file)
     iv = interventions(log).iloc[-1]
     _, cf_log = _run_one(job, "brake", "idle", shield_off_at=iv.t_start, t_stop=iv.t_end + 5,
-                         trigger="schedule")
+                         trigger="schedule", schedule_file=sched_file)
     n = int((log["t"] <= iv.t_start + 1e-9).sum())
     pd.testing.assert_series_equal(log["ego_x"].iloc[:n], cf_log["ego_x"].iloc[:n])
     assert log["vio_v"].first_valid_index() == cf_log["vio_v"].first_valid_index()

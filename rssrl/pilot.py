@@ -2,38 +2,31 @@
 
 import math
 from concurrent.futures import ProcessPoolExecutor
-from functools import lru_cache, partial
+from functools import partial
 from itertools import product
 
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-from rssrl.scenarios import make_scene, run_episode, violation_schedule
+from rssrl.scenarios import make_scene, run_episode
+from rssrl.schedules import DEFAULT_FILE, get_schedule
 
 RANDOM_POLICY_SEED_OFFSET = 1000  # seed случайной политики = seed сцены + 1000
 
 
-@lru_cache(maxsize=None)
-def _schedule(seed, kind, gamma):
-    """Расписание нарушения из эталонного прогона (кэш в процессе)."""
-    return violation_schedule(seed, kind=kind, gamma=gamma)
-
-
-def _make(job, kind, trigger="gap", dmin="jerk", **config):
+def _make(job, kind, trigger="gap", dmin="jerk", schedule_file=DEFAULT_FILE, **config):
     """trigger="gap" — нарушение по условию на зазор (момент зависит от агента),
-    "schedule" — по расписанию из эталонного прогона (одинаково для всех
-    вариантов агента; эталон — IDLE с фильтром и задержкой ρ)."""
+    "schedule" — по расписанию из файла schedule_file (одинаково для всех
+    вариантов агента; построено заранее эталоном IDM/MOBIL + RSS, см.
+    rssrl/schedules.py)."""
     seed, level, shield, delay = job
+    traffic = config.get("traffic", "following")
     if kind == "brake":
-        sched = _schedule(seed, "brake", 1.0) if trigger == "schedule" else None
-        if trigger == "schedule" and sched is None:
-            sched = {"t": math.inf, "uid": -1}
+        sched = get_schedule(seed, "brake", 1.0, traffic, schedule_file) if trigger == "schedule" else None
         return make_scene(seed, beta=level, shield=shield, reaction_delay=delay, schedule=sched, dmin=dmin, **config)
     if kind == "cutin":  # уровень — γ, β = 1
-        sched = _schedule(seed, "cutin", level) if trigger == "schedule" else None
-        if trigger == "schedule" and sched is None:
-            sched = {"t": math.inf, "uid": -1, "lane": None}
+        sched = get_schedule(seed, "cutin", level, traffic, schedule_file) if trigger == "schedule" else None
         return make_scene(seed, shield=shield, reaction_delay=delay, kind="cutin", gamma=level,
                           schedule=sched, dmin=dmin, **config)
     # nominal: нарушителя нет, уровень не используется (передавайте [1.0])
@@ -63,7 +56,7 @@ def _run_one(job, kind, policy, shield_off_at=None, t_stop=None, trigger="gap", 
 
 
 def run_grid(seeds, levels, variants, kind="brake", policy="idle", processes=None, trigger="gap", dmin="jerk",
-             emergency_brake=False):
+             emergency_brake=False, **config):
     """Прогнать все сочетания seed × уровень × вариант.
 
     levels — значения β (kind="brake") или γ (kind="cutin", β = 1).
@@ -74,6 +67,8 @@ def run_grid(seeds, levels, variants, kind="brake", policy="idle", processes=Non
     dmin — формула d_min в фильтре: "jerk" (с учетом рывка) или "lemma2".
     emergency_brake — False: базовая надлежащая реакция (основной вариант),
     True: тот же фильтр с дополнительным аварийным торможением.
+    config — остальные параметры сцены и расписаний: traffic ("following" /
+    "robustness"), driver ("policy" / "idm"), schedule_file.
     Возвращает (таблица исходов, словарь логов по ключу (seed, уровень, shield, delay)).
     Результат не зависит от числа процессов: каждый эпизод определяется
     только своим seed сцены (и seed политики).
@@ -81,7 +76,7 @@ def run_grid(seeds, levels, variants, kind="brake", policy="idle", processes=Non
     jobs = [(s, b, sh, d) for s, b, (sh, d) in product(seeds, levels, variants)]
     n = len(jobs)
     with ProcessPoolExecutor(processes) as pool:
-        run = partial(_run_one, trigger=trigger, dmin=dmin, emergency_brake=emergency_brake)
+        run = partial(_run_one, trigger=trigger, dmin=dmin, emergency_brake=emergency_brake, **config)
         results = list(pool.map(run, jobs, [kind] * n, [policy] * n))
     outcomes = pd.DataFrame([o for o, _ in results])
     logs = {job: log for job, (_, log) in zip(jobs, results)}

@@ -109,6 +109,7 @@ a_min_brake не спасает (агент выходит на -a_min_brake с 
 
 import math
 
+from highway_env.vehicle.behavior import IDMVehicle
 from highway_env.vehicle.controller import MDPVehicle
 
 from dataclasses import replace
@@ -354,7 +355,7 @@ class ShieldedVehicle(MDPVehicle):
     def act(self, action=None):
         previous_target = self.target_lane_index
         # 1. Политика -> ускорение и руль (стандартный перевод highway-env)
-        super().act(action)
+        self._policy_act(action)
         if self.crashed:
             return
         p = self.params
@@ -418,6 +419,10 @@ class ShieldedVehicle(MDPVehicle):
         self._last_act_clock = self.clock
         self._last_lc = (self.state["lc_requested"], self.state["lc_decision"])
 
+    def _policy_act(self, action):
+        """Номинальная команда политики: ускорение и руль в self.action."""
+        MDPVehicle.act(self, action)
+
     def _needs_emergency(self, relations):
         """Не хватит ли a_min_brake хотя бы для одной опасной машины впереди."""
         p = self.params
@@ -440,3 +445,19 @@ class ShieldedVehicle(MDPVehicle):
         self.a_prev = self.action["acceleration"]
         self.state["a_applied"] = self.a_prev
         self.clock += dt
+
+
+class ShieldedIDMVehicle(ShieldedVehicle, IDMVehicle):
+    """Агент IDM/MOBIL + RSS-фильтр (без RL).
+
+    Номинальную команду дает не политика, а стандартная модель highway-env:
+    ускорение по IDM, перестроения по MOBIL. Дальше — тот же фильтр, что у
+    ShieldedVehicle. Действие среды (env.step) игнорируется.
+    Используется как заранее выбранная эталонная политика для расписаний
+    нарушений (scenarios.violation_schedule) и как вариант «IDM/MOBIL + RSS
+    без RL». Такой эталон не нейтрален относительно RSS: он задает свое
+    распределение испытательных ситуаций.
+    """
+
+    def _policy_act(self, action):
+        IDMVehicle.act(self)
