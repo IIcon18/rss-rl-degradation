@@ -121,3 +121,18 @@ def test_manual_trigger():
     assert vio.events[0]["a_actual"][0] == pytest.approx(a_before - J_MAX * DT)
     assert a_before > -8.0 + J_MAX * DT  # мгновенно до -8 не дошло
     env.close()
+
+
+def test_violating_step_flag_covers_the_stopping_step():
+    """На шаге остановки нарушитель еще тормозит (vio_a этого шага —
+    торможение), а violating после шага уже False: флаг violating_step
+    отмечает, что этот шаг был шагом нарушения."""
+    from rssrl.scenarios import make_scene, run_episode, violation_schedule
+
+    sched = violation_schedule(0)
+    _, log = run_episode(make_scene(0, beta=2.0, shield=True, schedule=sched))
+    stop = log.index[(log["vio_v"] <= 1e-9) & log["vio_v"].shift().gt(1e-9)]
+    assert len(stop)
+    i = stop[0]
+    assert not log.loc[i, "vio_violating"] and log.loc[i, "vio_violating_step"]
+    assert log.loc[i, "vio_a"] < 0

@@ -50,8 +50,13 @@ def _run_one(job, kind, policy, shield_off_at=None, t_stop=None, trigger="gap", 
     outcome, log = run_episode(scene, policy=_policy(job[0], policy), t_stop=t_stop)
     outcome["policy"] = policy
     outcome["lc_requested"] = int(log["lc_requested"].sum())
-    outcome["lc_blocked"] = int((log["lc_decision"] == "blocked").sum())
-    outcome["lc_cancelled"] = int((log["lc_decision"] == "cancelled").sum())
+    # «фильтр запретил бы» (гипотетическое решение, считается и без фильтра)
+    # и «фильтр реально вмешался» — разные счетчики
+    outcome["lc_would_block"] = int((log["lc_decision"] == "blocked").sum())
+    outcome["lc_would_cancel"] = int((log["lc_decision"] == "cancelled").sum())
+    outcome["lc_blocked"] = int((log["lc_intervened"] == "blocked").sum())
+    outcome["lc_cancelled"] = int((log["lc_intervened"] == "cancelled").sum())
+    outcome["would_brake_steps"] = int(log["would_brake"].sum())
     return outcome, log
 
 
@@ -102,7 +107,9 @@ def interventions(log, merge_gap=MERGE_GAP, dt=1 / 15):
     if not len(log):
         return pd.DataFrame(columns=["t_start", "t_end", "brake_steps", "lc_steps"])
     brake = log["shield_active"].astype(bool)
-    lc = log["lc_decision"].isin(["blocked", "cancelled"])
+    # только реально выполненные вмешательства (не «фильтр запретил бы»)
+    col = "lc_intervened" if "lc_intervened" in log else "lc_decision"
+    lc = log[col].isin(["blocked", "cancelled"])
     rows = log[brake | lc]
     out = []
     for t, b, l in zip(rows["t"], brake[rows.index], lc[rows.index]):
@@ -124,7 +131,7 @@ def counterfactual(job, kind, policy, t_start, t_end, horizon=CF_HORIZON, trigge
     столкновение. До t_start прогон совпадает с исходным: сцена
     детерминирована своим seed. Если окно выходит за конец эпизода (40 с),
     лимит времени среды продлевается до конца окна, иначе вмешательства в
-    конце эпизода выглядели бы «лишними» только из-за обрезанного окна
+    конце эпизода выглядели бы безопасными только из-за обрезанного окна
     (расстановка машин от длительности эпизода не зависит).
     trigger — как в исходном прогоне ("gap" или "schedule"), иначе сцена
     до t_start не совпадет с исходной. config — остальные параметры сцены
@@ -155,8 +162,12 @@ def counterfactual_grid(logs, kind="brake", policy="idle", processes=None, trigg
     контрфактический прогон без вмешательства (параллельно).
 
     logs — словарь логов из run_grid (ключ (seed, уровень, shield, delay)).
-    Вмешательство «нужное», если без него в окне было бы столкновение,
-    иначе «лишнее». Возвращает DataFrame: одна строка — одно вмешательство.
+    Результат — диагностика на выбранном горизонте, а не доказательство:
+    collision — без вмешательства в окне (до t_end + CF_HORIZON) было бы
+    столкновение; no_collision_5s — столкновения на горизонте 5 с нет. Это
+    не значит, что вмешательство было ненужным или нарушало правила RSS:
+    RSS страхует от худшего случая, который мог не наступить в этом окне.
+    Возвращает DataFrame: одна строка — одно вмешательство.
     """
     tasks = []
     for job, log in logs.items():
@@ -169,7 +180,7 @@ def counterfactual_grid(logs, kind="brake", policy="idle", processes=None, trigg
         rows = list(pool.map(_cf_one, tasks))
     df = pd.DataFrame(rows)
     if len(df):
-        df["needed"] = df["collision"]
+        df["no_collision_5s"] = ~df["collision"].astype(bool)
         df["duration"] = df["t_end"] - df["t_start"]
     return df
 

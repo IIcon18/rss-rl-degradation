@@ -81,7 +81,9 @@ class EpisodeLogger:
                     "vio_y": ego.lane.local_coordinates(vio.position)[1],
                     "vio_vy": vy,
                     "vio_gap": self._gap_to_ego(vio),
-                    "vio_violating": vio.violating,
+                    "vio_violating": vio.violating,  # состояние после шага
+                    # нарушал ли на этом шаге (к нему относится vio_a)
+                    "vio_violating_step": getattr(vio, "violating_step", vio.violating),
                     "vio_is_front": ego.state.get("front_id") == getattr(vio, "uid", -1),
                 }
             )

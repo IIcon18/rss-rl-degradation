@@ -24,11 +24,28 @@
      только если пересечение разметки было не раньше начала опасной
      ситуации, приведшей к удару (t_cross >= t_danger).
 4. Агент отвечает, если не выполнил правильную реакцию:
-   - партнер впереди: команда торможения не слабее a_min_brake не началась
-     за ρ после t_danger (допуск полшага) или была отпущена до столкновения,
-     пока опасность сохранялась. Смотрим на команду, а не на фактическое
-     ускорение: правило RSS — о том, когда начать торможение, а набирается
-     оно с ограниченным рывком;
+   - партнер впереди. Различаем два события (при ограниченном рывке это
+     разные моменты):
+     * команда торможения: первый шаг опасного отрезка, на котором команда
+       (a_executed) не слабее a_min_brake; t_cmd — начало этого шага;
+     * фактическое торможение: первый шаг, на котором фактическое ускорение
+       агента (ego_a — по изменению скорости за шаг) дошло до -a_min_brake
+       (с допуском ACCEL_TOL) или агент уже стоит; t_reached — начало шага.
+     Агент отвечает, если команда началась позже ρ после t_danger, или
+     фактическое торможение достигнуто позже ρ + TAU_JERK (TAU_JERK =
+     (a_max_accel + a_min_brake) / J_MAX = 0,7 с — время набора торможения
+     из худшего случая, заложенное в d_min с учетом рывка), или торможение
+     отпущено до столкновения, пока опасность сохранялась: команда стала
+     слабее a_min_brake, или фактическое ускорение после достижения снова
+     слабее -a_min_brake, пока агент еще едет.
+     Если удар случился раньше срока (ρ или ρ + TAU_JERK от t_danger),
+     опоздание по этому признаку не засчитывается.
+     Допуска «полшага» нет: t_danger, t_cmd и t_reached лежат на одной
+     сетке шагов 1/15 с (начала шагов), поэтому разности — целое число
+     шагов, и сравнение с ρ точное (допуск 1e-9 — только на округление
+     суммы шагов в float). Фильтр с задержкой ρ дает команду через 6 шагов
+     (0,4 с) после t_danger, то есть не позже 7 шагов (0,467 с) после
+     последнего безопасного шага;
    - партнер сзади (агент — передняя машина): агент фактически тормозил
      сильнее a_max_brake (например, экстренный режим фильтра) — для машины
      сзади это нарушение допущения RSS.
@@ -40,9 +57,12 @@
 
 import math
 
+from rssrl.dynamics import J_MAX
 from rssrl.rss import DEFAULT
 
 ACCEL_TOL = 0.05  # м/с^2
+TIME_TOL = 1e-9  # с, только округление суммы шагов в float
+STOP_V = 1e-6  # м/с: агент стоит
 CUTIN_TOL = 0.01  # относительный
 
 AGENT, VIOLATOR, BOTH, UNKNOWN = "агент", "нарушитель", "оба", "не установлено"
@@ -102,7 +122,12 @@ def assign_responsibility(log, outcome, p=DEFAULT, dt=1 / 15):
     if is_violator:
         if "vio_a" in log:
             during = log.loc[idx] if idx else log.loc[:end]
-            during = during[during["vio_violating"].fillna(False).astype(bool)]
+            # vio_violating_step: нарушитель исполнял нарушение на этом шаге
+            # (строка лога пишется в конце шага; vio_violating к этому моменту
+            # уже сброшен, если на этом шаге нарушитель остановился, а vio_a
+            # этого шага — еще его торможение)
+            col = "vio_violating_step" if "vio_violating_step" in during else "vio_violating"
+            during = during[during[col].fillna(False).astype(bool)]
             if len(during):
                 vio_min_a = float(during["vio_a"].min())
                 harsh = vio_min_a < -p.a_max_brake - ACCEL_TOL
@@ -112,22 +137,38 @@ def assign_responsibility(log, outcome, p=DEFAULT, dt=1 / 15):
     violator_fault = harsh or cut_close
 
     # агент
-    reaction_time = math.nan
-    released = late = front_harsh = False
+    tau_jerk = (p.a_max_accel + p.a_min_brake) / J_MAX
+    reaction_cmd = reaction_actual = math.nan
+    late = late_actual = released = front_harsh = False
     if t_danger is not None:
         run = log.loc[idx]
+        # сколько длилась опасная ситуация до удара (начало последнего шага):
+        # если удар раньше срока, опоздать агент не мог
+        t_last = float(run["t"].iloc[-1]) - dt - t_danger
         if position == "ahead":
             braking = (run["a_executed"] <= -p.a_min_brake + 1e-9).to_numpy()
             if braking.any():
                 k = int(braking.argmax())
-                reaction_time = float(run["t"].iloc[k]) - dt - t_danger
-                late = reaction_time > p.rho + dt / 2
+                reaction_cmd = float(run["t"].iloc[k]) - dt - t_danger
+                late = reaction_cmd > p.rho + TIME_TOL
                 released = not braking[k:].all()
             else:
-                late = True
+                late = t_last > p.rho + TIME_TOL
+            moving = (run["ego_v"] > STOP_V).to_numpy() if "ego_v" in run else None
+            reached = (run["ego_a"] <= -p.a_min_brake + ACCEL_TOL).to_numpy()
+            if moving is not None:
+                reached = reached | ~moving
+            if reached.any():
+                k = int(reached.argmax())
+                reaction_actual = float(run["t"].iloc[k]) - dt - t_danger
+                late_actual = reaction_actual > p.rho + tau_jerk + TIME_TOL
+                after = reached[k:]
+                released = released or not after.all()
+            else:
+                late_actual = t_last > p.rho + tau_jerk + TIME_TOL
         else:
             front_harsh = bool((run["ego_a"] < -p.a_max_brake - ACCEL_TOL).any())
-    agent_fault = late or released or front_harsh
+    agent_fault = late or late_actual or released or front_harsh
 
     if agent_fault and violator_fault:
         who = BOTH
@@ -143,8 +184,10 @@ def assign_responsibility(log, outcome, p=DEFAULT, dt=1 / 15):
         "partner_is_violator": is_violator,
         "t_danger": t_danger,
         "partner_position": position,
-        "reaction_time": reaction_time,
+        "reaction_time_command": reaction_cmd,
+        "reaction_time_actual": reaction_actual,
         "agent_late": late,
+        "agent_late_actual": late_actual,
         "agent_released": released,
         "agent_front_harsh": front_harsh,
         "violator_min_accel": vio_min_a,

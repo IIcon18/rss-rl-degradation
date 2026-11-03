@@ -74,6 +74,10 @@ class BrakingViolator(BoundedIDMVehicle):
         self.trigger = trigger
         self.clock = 0.0  # собственные часы, с
         self.violating = False  # сейчас тормозит
+        # исполнял ли нарушение на последнем шаге step(): строка лога пишется
+        # после шага, и на шаге остановки violating уже сброшен, а ускорение
+        # этого шага — еще торможение нарушения
+        self.violating_step = False
         self.finished = False  # уже отторможен до нуля
         self.events = []  # по одному словарю на каждое нарушение
 
@@ -157,6 +161,7 @@ class BrakingViolator(BoundedIDMVehicle):
         self.action = {"steering": steering, "acceleration": acceleration}
 
     def step(self, dt):
+        self.violating_step = self.violating
         if not self.violating:
             super().step(dt)
             self.clock += dt
@@ -253,6 +258,7 @@ class CutInViolator(BrakingViolator):
         if not self.cutting:
             super().step(dt)
             return
+        self.violating_step = self.violating
         c = self.cut
         if self.crashed:
             self.cutting = False

@@ -4,6 +4,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from rssrl.dynamics import limit_jerk
 from rssrl.responsibility import AGENT, BOTH, UNKNOWN, VIOLATOR, assign_responsibility, danger_onset
 from rssrl.scenarios import make_scene, run_episode
 
@@ -12,23 +13,32 @@ VIO = 7  # uid нарушителя
 
 
 def fake_log(n=60, danger_from=30, crash_at=50, brake_from=None, release_at=None,
-             vio_a=-5.0, behind=False, ego_a=0.0):
+             vio_a=-5.0, behind=False, ego_a=None):
     """Лог: опасность с нарушителем с шага danger_from, столкновение на шаге
-    crash_at; агент командует -4 с шага brake_from (до release_at)."""
+    crash_at; агент командует -4 с шага brake_from (до release_at).
+    Фактическое ускорение агента (ego_a) идет за командой с рывком J_MAX,
+    если ego_a не задано числом."""
     t = np.arange(1, n + 1) * DT
     ids = [[VIO] if danger_from <= i <= crash_at else [] for i in range(n)]
     a_cmd = np.zeros(n)
     if brake_from is not None:
         a_cmd[brake_from:release_at] = -4.0
+    if ego_a is None:
+        ego_a, a = np.zeros(n), 0.0
+        for i in range(n):
+            a = limit_jerk(a_cmd[i], a, DT)
+            ego_a[i] = a
     return pd.DataFrame({
         "t": t,
         "crashed": np.arange(n) >= crash_at,
         "danger_ahead_ids": [[] for _ in ids] if behind else ids,
         "danger_behind_ids": ids if behind else [[] for _ in ids],
         "a_executed": a_cmd,
-        "ego_a": np.full(n, ego_a),
+        "ego_a": np.broadcast_to(ego_a, (n,)).astype(float),
+        "ego_v": np.full(n, 20.0),
         "vio_a": np.full(n, vio_a),
         "vio_violating": np.arange(n) >= danger_from - 5,
+        "vio_violating_step": np.arange(n) >= danger_from - 5,
     })
 
 
@@ -60,8 +70,8 @@ def test_harsh_braking_in_earlier_resolved_situation_does_not_count():
     снова поехал и въехал в стоящего нарушителя. Резкое торможение было в
     прошлой, уже закончившейся ситуации — нарушитель за удар не отвечает."""
     log = fake_log(danger_from=40, crash_at=50, brake_from=46, vio_a=0.0)
-    log["vio_violating"] = False
-    log.loc[5:20, "vio_violating"] = True
+    log["vio_violating"] = log["vio_violating_step"] = False
+    log.loc[5:20, ["vio_violating", "vio_violating_step"]] = True
     log.loc[5:20, "vio_a"] = -10.0  # резкое торможение давно, до последней опасной ситуации
     assert who(log) == UNKNOWN
 
@@ -85,7 +95,43 @@ def test_late_reaction_is_agent_fault():
     # 9 шагов = 0,6 с > ρ = 0,5 с
     r = assign_responsibility(fake_log(brake_from=39), outcome())
     assert r["responsible"] == AGENT and r["agent_late"]
-    assert r["reaction_time"] == pytest.approx(0.6)
+    assert r["reaction_time_command"] == pytest.approx(0.6)
+
+
+def test_command_and_actual_braking_are_different_moments():
+    """Команда через 6 шагов (0,4 с), фактическое -4 м/с^2 с рывком 10 м/с^3
+    от нуля — еще через 0,4 с (6 шагов): реакция вовремя, оба момента в логе."""
+    r = assign_responsibility(fake_log(brake_from=36), outcome(gap_cross=None))
+    assert r["reaction_time_command"] == pytest.approx(0.4)
+    assert r["reaction_time_actual"] == pytest.approx(0.4 + 5 * DT)
+    assert not r["agent_late"] and not r["agent_late_actual"]
+
+
+def test_command_in_time_but_actual_braking_never_reached_is_agent_fault():
+    """Команда вовремя, но машина фактически не тормозит (ego_a = 0)."""
+    r = assign_responsibility(fake_log(brake_from=36, ego_a=0.0), outcome())
+    assert not r["agent_late"] and r["agent_late_actual"]
+    assert r["responsible"] == AGENT
+
+
+def test_reaction_exactly_rho_is_in_time_one_step_more_is_late():
+    """Допуска полшага нет: ровно ρ (7,5 шага не бывает — 7 шагов = 0,467 с)
+    — вовремя, 8 шагов = 0,533 с — поздно."""
+    assert not assign_responsibility(fake_log(brake_from=37), outcome())["agent_late"]
+    assert assign_responsibility(fake_log(brake_from=38), outcome())["agent_late"]
+
+
+def test_violator_harsh_braking_on_stopping_step_is_not_lost():
+    """Пограничный случай: на шаге остановки нарушитель еще тормозит
+    10 м/с^2, а vio_violating в строке этого шага уже сброшен. Признак
+    vio_violating_step (нарушал на этом шаге) сохраняет этот шаг в проверке."""
+    log = fake_log(brake_from=36, vio_a=-5.0)
+    log["vio_violating"] = False
+    log["vio_violating_step"] = False
+    log.loc[45, "vio_violating_step"] = True  # шаг остановки
+    log.loc[45, "vio_a"] = -10.0
+    r = assign_responsibility(log, outcome())
+    assert r["violator_harsh"] and r["responsible"] == VIOLATOR
 
 
 def test_released_brake_while_dangerous_is_agent_fault():

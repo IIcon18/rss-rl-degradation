@@ -256,7 +256,7 @@ class ShieldedVehicle(MDPVehicle):
         self.lc_origin = None  # полоса, из которой начато текущее перестроение
         self.state = {}  # решение на текущем шаге, читает логгер
         self._last_act_clock = None
-        self._last_lc = (False, None)
+        self._last_lc = (False, None, None)
 
     @classmethod
     def replace(cls, vehicle, shield_enabled=True, params=SHIELD_DEFAULT, reaction_delay=DEFAULT.rho,
@@ -408,7 +408,13 @@ class ShieldedVehicle(MDPVehicle):
             "danger_ahead_ids": [getattr(r["vehicle"], "uid", None) for r in relations if r["dangerous"] and r["ahead"]],
             "danger_behind_ids": [getattr(r["vehicle"], "uid", None) for r in relations if r["dangerous"] and not r["ahead"]],
             "lc_requested": nominal_target != previous_target,
+            # lc_decision — что фильтр решил бы (считается и без фильтра, для
+            # сравнения); lc_intervened — что он реально сделал (только с фильтром)
             "lc_decision": lc_decision,
+            "lc_intervened": lc_decision if self.filtering else None,
+            # would_brake — по правилу пора тормозить (и без фильтра);
+            # shield_active — фильтр реально тормозит
+            "would_brake": reacting,
         }
         # На первом шаге каждого решения highway-env вызывает act() дважды:
         # с действием политики и затем без него. Чтобы второй вызов не стер
@@ -416,8 +422,9 @@ class ShieldedVehicle(MDPVehicle):
         if self._last_act_clock == self.clock:
             self.state["lc_requested"] |= self._last_lc[0]
             self.state["lc_decision"] = self.state["lc_decision"] or self._last_lc[1]
+            self.state["lc_intervened"] = self.state["lc_intervened"] or self._last_lc[2]
         self._last_act_clock = self.clock
-        self._last_lc = (self.state["lc_requested"], self.state["lc_decision"])
+        self._last_lc = (self.state["lc_requested"], self.state["lc_decision"], self.state["lc_intervened"])
 
     def _policy_act(self, action):
         """Номинальная команда политики: ускорение и руль в self.action."""

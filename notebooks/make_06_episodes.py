@@ -13,7 +13,7 @@ code = nbformat.v4.new_code_cell
 
 cells = [
     md(
-        "# Этап 6. Эпизоды: исходы, пробег, «лишние» срабатывания фильтра\n\n"
+        "# Этап 6. Эпизоды: исходы, пробег, контрфактическая проверка вмешательств фильтра\n\n"
         "Код: `classify_outcome`, `run_episode` в `rssrl/scenarios.py`; `interventions`, "
         "`counterfactual`, `counterfactual_grid` в `rssrl/pilot.py`. "
         "Проверки: `tests/test_episodes.py`.\n\n"
@@ -27,8 +27,10 @@ cells = [
         "запрет/отмена перестроения) проверяем так: заново прогоняем ту же сцену с той же "
         "политикой, но с момента вмешательства фильтр отключен — на все время вмешательства "
         "и еще 5 с после. До этого момента прогон совпадает с исходным (сцена детерминирована "
-        "своим seed — это проверяет тест). Если в этом окне агент столкнулся бы — "
-        "вмешательство **нужное**, если нет — **лишнее**.\n\n"
+        "своим seed — это проверяет тест). Результат — диагностика на выбранном горизонте: "
+        "«без вмешательства — столкновение на горизонте 5 с» или «нет столкновения на "
+        "горизонте 5 с». Второе не доказывает, что вмешательство было ненужным или нарушало "
+        "правила RSS: RSS страхует от худшего случая, который в этом окне мог не наступить.\n\n"
         "Вмешательства с перерывом меньше 1 с считаем одним: иначе «дребезг» фильтра "
         "на границе d_min (+3/−4 м/с² через шаг) дал бы сотни коротких вмешательств.\n\n"
         "Фильтр: d_min — лемма 2 с учетом рывка 10 м/с³. Нарушение (тормозящий лидер, "
@@ -108,30 +110,30 @@ cells = [
         "cf.drop(columns=['crash_partners']).to_csv(PILOT / 'counterfactual.csv', index=False)\n"
         "\n"
         "cf_table = cf.groupby(['сценарий', 'level', 'вариант'], sort=False).agg(\n"
-        "    вмешательств=('needed', 'size'),\n"
-        "    нужных=('needed', 'sum'),\n"
+        "    вмешательств=('collision', 'size'),\n"
+        "    столкновение_без_вмешательства_5с=('collision', 'sum'),\n"
         "    длительность_с=('duration', 'mean'),\n"
         ")\n"
-        "cf_table['доля нужных'] = (cf_table['нужных'] / cf_table['вмешательств']).round(2)\n"
+        "cf_table['доля со столкновением без вмешательства'] = (cf_table['столкновение_без_вмешательства_5с'] / cf_table['вмешательств']).round(2)\n"
         "cf_table.round(1)"
     ),
     code(
         "by_type = cf.groupby(['сценарий', 'тип'], sort=False).agg(\n"
-        "    вмешательств=('needed', 'size'), нужных=('needed', 'sum'))\n"
-        "by_type['доля нужных'] = (by_type['нужных'] / by_type['вмешательств']).round(2)\n"
+        "    вмешательств=('collision', 'size'), столкновение_без_вмешательства_5с=('collision', 'sum'))\n"
+        "by_type['доля'] = (by_type['столкновение_без_вмешательства_5с'] / by_type['вмешательств']).round(2)\n"
         "by_type"
     ),
     code(
-        "# доля нужных по сценариям и задержкам — столбики «нужные / лишние»\n"
-        "g = cf.groupby(['сценарий', 'level', 'reaction_delay'], sort=False)['needed'].agg(['sum', 'size']).reset_index()\n"
+        "# по сценариям и задержкам: со столкновением без вмешательства / без столкновения на 5 с\n"
+        "g = cf.groupby(['сценарий', 'level', 'reaction_delay'], sort=False)['collision'].agg(['sum', 'size']).reset_index()\n"
         "SHORT = {'номинальный, IDLE': 'номин.\\nIDLE', 'номинальный, случайная': 'номин.\\nслучайная',\n"
         "         'тормозящий лидер, IDLE': 'тормоз.\\nβ = {:g}', 'подрезание, IDLE': 'подрез.\\nγ = {:g}'}\n"
         "g['подпись'] = [SHORT[s].format(l) + f\"\\nзадержка {'ρ' if d else '0'}\"\n"
         "              for s, l, d in zip(g['сценарий'], g['level'], g['reaction_delay'])]\n"
         "fig, ax = plt.subplots(figsize=(11, 4))\n"
         "x = np.arange(len(g))\n"
-        "ax.bar(x, g['sum'], color='#2c6fbb', label='нужное (без него — столкновение)')\n"
-        "ax.bar(x, g['size'] - g['sum'], bottom=g['sum'], color='#bdc3c7', label='лишнее (без него — без столкновения)')\n"
+        "ax.bar(x, g['sum'], color='#2c6fbb', label='без вмешательства — столкновение на горизонте 5 с')\n"
+        "ax.bar(x, g['size'] - g['sum'], bottom=g['sum'], color='#bdc3c7', label='нет столкновения на горизонте 5 с')\n"
         "for xi, (s, n) in enumerate(zip(g['sum'], g['size'])):\n"
         "    ax.text(xi, n + 1, f'{s}/{n}', ha='center', fontsize=8)\n"
         "ax.set_xticks(x, g['подпись'], fontsize=8)\n"
@@ -164,11 +166,11 @@ cells = [
     ),
     code(
         "idle = cf[cf['сценарий'].str.contains('IDLE')]\n"
-        "idle.groupby('needed').agg(\n"
+        "idle.groupby('collision').agg(\n"
         "    вмешательств=('t_start', 'size'),\n"
         "    начались_в_первые_3_с=('t_start', lambda t: int((t < 3).sum())),\n"
         "    медиана_длительности_с=('duration', 'median'),\n"
-        ").rename(index={False: 'лишние', True: 'нужные'})"
+        ").rename(index={False: 'нет столкновения на 5 с', True: 'столкновение без вмешательства'})"
     ),
     md(
         "Лишних у IDLE много за счет коротких торможений при задержке ρ (медиана длительности "
@@ -177,9 +179,9 @@ cells = [
         "короткие торможения на границе d_min. Для экспериментов по-прежнему разумно не "
         "считать вмешательства в первые 3 с."
     ),
-    md("## Пример «лишнего» торможения: исходный прогон и прогон без вмешательства"),
+    md("## Пример торможения, без которого нет столкновения на горизонте 5 с"),
     code(
-        "extra = cf[(~cf.needed) & (cf['тип'] == 'торможение') & (cf.duration > 0.5)].sort_values('duration', ascending=False)\n"
+        "extra = cf[(cf.no_collision_5s) & (cf['тип'] == 'торможение') & (cf.duration > 0.5)].sort_values('duration', ascending=False)\n"
         "ex = extra.iloc[0]\n"
         "kind, policy, logs = LOGS[ex['сценарий']]\n"
         "job = (int(ex.seed), ex.level, True, ex.reaction_delay)\n"
@@ -200,7 +202,7 @@ cells = [
         "axes[1].set_xlabel('время, с (серое — вмешательство фильтра)')\n"
         "axes[0].legend(fontsize=7, frameon=False, ncol=2)\n"
         "axes[1].legend(fontsize=8, frameon=False)\n"
-        "axes[0].set_title(f\"{ex['сценарий']}, сцена {int(ex.seed)}, {NAMES[(True, ex.reaction_delay)]}: лишнее торможение\", fontsize=10)\n"
+        "axes[0].set_title(f\"{ex['сценарий']}, сцена {int(ex.seed)}, {NAMES[(True, ex.reaction_delay)]}: без вмешательства нет столкновения на 5 с\", fontsize=10)\n"
         "fig.tight_layout()\n"
         "fig.savefig(FIG / '06_extra_intervention.png', dpi=150)\n"
         "ex[['сценарий', 'seed', 't_start', 't_end', 'brake_steps', 'lc_steps', 'min_gap']]"

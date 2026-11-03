@@ -82,7 +82,15 @@ def test_without_shield_lane_change_is_not_blocked():
     lane_before = ego.target_lane_index
     ego.act("LANE_LEFT")
     assert ego.state["lc_decision"] == "blocked"  # фильтр бы запретил (видно в логе)
-    assert ego.target_lane_index != lane_before  # но без фильтра агент едет
+    assert ego.state["lc_intervened"] is None  # но реального вмешательства нет
+    assert ego.target_lane_index != lane_before  # и без фильтра агент едет
+
+
+def test_with_shield_block_is_a_real_intervention():
+    env, ego = road_with_ego()
+    add_car(env, 10.0, 0.0, 25.0)
+    ego.act("LANE_LEFT")
+    assert ego.state["lc_decision"] == ego.state["lc_intervened"] == "blocked"
 
 
 def test_started_lane_change_is_cancelled_when_it_becomes_dangerous():

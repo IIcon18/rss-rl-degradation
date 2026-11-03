@@ -72,6 +72,26 @@ def test_interventions_merge_short_gaps():
     assert iv["t_end"].iloc[0] == pytest.approx(30 * DT)
 
 
+def test_hypothetical_block_is_not_an_intervention():
+    """«Фильтр запретил бы» (lc_decision) без реального вмешательства
+    (lc_intervened пусто, например фильтр отключен) — не вмешательство."""
+    n = 30
+    decision = np.array([None] * n, dtype=object)
+    decision[10] = "blocked"
+    log = pd.DataFrame({"t": np.arange(1, n + 1) * DT, "shield_active": np.zeros(n, bool),
+                        "lc_decision": decision, "lc_intervened": np.array([None] * n, dtype=object)})
+    assert len(interventions(log)) == 0
+
+
+def test_lane_change_counters_split_hypothetical_and_real():
+    """Без фильтра «запретил бы» может быть > 0, а реальных запретов нет."""
+    o, _ = _run_one((1, 1.0, False, 0.5), "nominal", "random")
+    assert o["lc_blocked"] == 0 and o["lc_cancelled"] == 0
+    assert o["lc_would_block"] >= 0
+    o, _ = _run_one((1, 1.0, True, 0.5), "nominal", "random")
+    assert o["lc_blocked"] <= o["lc_would_block"]
+
+
 # ---------- контрфактический прогон ----------
 
 JOB = (3, 1.0, True, 0.0)  # сцена 3, номинальный режим, фильтр, задержка 0
