@@ -88,3 +88,14 @@ def test_all_variants_use_the_same_schedule_and_log_role(sched):
                 assert o["violator_role"] in {"лидер", "впереди в полосе агента, не лидер",
                                               "впереди в другой полосе", "позади или рядом"}
                 assert math.isfinite(o["gap_at_trigger"])
+
+
+def test_cutin_lane_survives_file_round_trip(tmp_path):
+    """Полоса подрезания из файла совпадает с прямым прогоном эталона, даже
+    если рядом лежит файл, где у части сцен полосы нет (пропуски в CSV)."""
+    save_schedules(build_schedules([0], kind="cutin", gammas=(1.0,)), tmp_path / "cutin.csv")
+    df = build_schedules([0])
+    df.loc[0, ["t", "uid", "lane_from", "lane_to", "lane_id"]] = None  # «не назначено»
+    save_schedules(df, tmp_path / "brake.csv")
+    direct = violation_schedule(0, kind="cutin", gamma=1.0)
+    assert get_schedule(0, "cutin", 1.0, "following", tmp_path)["lane"] == direct["lane"]

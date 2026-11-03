@@ -101,7 +101,10 @@ def load_schedules(path=DEFAULT_FILE):
     новым файлом, старые файлы не меняются). Одна сцена в двух файлах — ошибка."""
     path = Path(path)
     files = sorted(path.glob("*.csv")) if path.is_dir() else [path]
-    df = pd.concat([pd.read_csv(f) for f in files], ignore_index=True)
+    # узлы полосы — строки ("0", "1"); без dtype pandas прочтет их числами, а
+    # при пропусках в другом файле — дробями ("0.0"), и полоса не совпадет
+    df = pd.concat([pd.read_csv(f, dtype={"lane_from": str, "lane_to": str}) for f in files],
+                   ignore_index=True)
     keys = df[["seed", "kind", "gamma", "traffic"]]
     if keys.duplicated().any():
         raise ValueError(f"повтор сцен в расписаниях {path}: {keys[keys.duplicated()].head().to_dict('records')}")

@@ -200,14 +200,18 @@ def assign_responsibility(log, outcome, p=DEFAULT, dt=1 / 15):
 def responsibility_table(outcomes, logs):
     """Ответственность для всех столкновений сетки run_grid.
     outcomes — таблица исходов, logs — словарь логов по ключу (seed, уровень,
-    shield, delay); run_grid строит их из одного списка эпизодов в одном
-    порядке, поэтому строки и логи идут парами."""
+    shield, delay[, emergency_brake]); run_grid и run_variants строят их из
+    одного списка эпизодов в одном порядке, поэтому строки и логи идут парами."""
     import pandas as pd
 
     rows = []
-    for o, ((seed, level, shield, delay), log) in zip(outcomes.to_dict("records"), logs.items()):
+    for o, (key, log) in zip(outcomes.to_dict("records"), logs.items()):
+        seed, level, shield, delay = key[:4]
         assert o["seed"] == seed and o["shield"] == shield and o["reaction_delay"] == delay
         r = assign_responsibility(log, o)
         if r is not None:
-            rows.append({"seed": seed, "level": level, "shield": shield, "reaction_delay": delay, **r})
+            extra = {"emergency_brake": key[4]} if len(key) > 4 else {}
+            if "вариант" in o:
+                extra["вариант"] = o["вариант"]
+            rows.append({"seed": seed, "level": level, "shield": shield, "reaction_delay": delay, **extra, **r})
     return pd.DataFrame(rows)

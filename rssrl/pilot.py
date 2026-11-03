@@ -1,9 +1,12 @@
-"""Прогон сетки эпизодов параллельно и график временных рядов эпизода."""
+"""Прогон сетки эпизодов параллельно, выгрузка первичных данных пилота и
+график временных рядов эпизода."""
 
+import json
 import math
 from concurrent.futures import ProcessPoolExecutor
 from functools import partial
 from itertools import product
+from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -88,6 +91,80 @@ def run_grid(seeds, levels, variants, kind="brake", policy="idle", processes=Non
     return outcomes, logs
 
 
+def run_variants(seeds, levels, variants, kind="brake", policy="idle", processes=None, **config):
+    """Как run_grid, но варианты — четверки (имя, shield, задержка,
+    emergency_brake), например ("базовая, ρ", True, 0.5, False). Все варианты
+    на одних и тех же сценах. Возвращает (таблица исходов с колонкой
+    «вариант», логи по ключу (seed, уровень, shield, задержка, emergency_brake))."""
+    frames, logs = [], {}
+    for em in sorted({v[3] for v in variants}):
+        pairs = [(sh, d) for _, sh, d, e in variants if e == em]
+        o, lg = run_grid(seeds, levels, pairs, kind=kind, policy=policy, processes=processes,
+                         emergency_brake=em, **config)
+        frames.append(o)
+        logs.update({(*k, em): log for k, log in lg.items()})
+    out = pd.concat(frames, ignore_index=True)
+    names = {(sh, d, e): n for n, sh, d, e in variants}
+    out["вариант"] = [names[(s, d, e)] for s, d, e in zip(out["shield"], out["reaction_delay"],
+                                                            out["emergency_brake"])]
+    return out, logs
+
+
+def variant_slug(shield, delay, emergency):
+    """Короткое имя варианта для файлов: shield-base_d0.5, shield-emerg_d0, noshield."""
+    if not shield:
+        return "noshield"
+    return f"shield-{'emerg' if emergency else 'base'}_d{delay:g}"
+
+
+def export_pilot(outcomes, logs, folder, responsibility=None, params=None, all_logs=False):
+    """Первичные данные пилота в folder (письмо 29.10, п. 8):
+    - outcomes.csv — таблица исходов всех эпизодов (seed сцены, уровень, вариант, ...);
+    - responsibility.csv — ответственность по каждому столкновению;
+    - collisions/<вариант>[_доп. части ключа]_l<уровень>_s<seed>.csv.gz — покадровые журналы
+      (шаг 1/15 с) всех эпизодов со столкновением (all_logs=True — всех эпизодов);
+    - params.json — параметры RSS, динамики, сцены, seed, файлы расписаний и
+      версия кода.
+    По этим файлам можно заново собрать парные сравнения и проверить
+    ответственность без повторного прогона."""
+    from rssrl.dynamics import A_PHYS_BRAKE, J_MAX
+    from rssrl.rss import DEFAULT
+    from rssrl.scenarios import REFERENCE, VIOLATION_T_RANGE
+    from rssrl.schedules import SCHEDULE_DIR, code_version
+    from rssrl.shield import SHIELD_DEFAULT, SIM_DT
+
+    folder = Path(folder)
+    (folder / "collisions").mkdir(parents=True, exist_ok=True)
+    for old in (folder / "collisions").glob("*.csv.gz"):
+        old.unlink()
+    outcomes.assign(crash_partners=outcomes["crash_partners"].map(json.dumps)).to_csv(
+        folder / "outcomes.csv", index=False)
+    if responsibility is not None:
+        responsibility.to_csv(folder / "responsibility.csv", index=False)
+    n = 0
+    for o, (key, log) in zip(outcomes.to_dict("records"), logs.items()):
+        if not (all_logs or o["collision"]):
+            continue
+        seed, level, shield, delay = key[:4]
+        emergency = key[4] if len(key) > 4 else False
+        extra = "".join(f"_{x}" for x in key[5:])  # например фон и политика
+        name = f"{variant_slug(shield, delay, emergency)}{extra}_l{level:g}_s{seed}.csv.gz"
+        log.to_csv(folder / "collisions" / name, index=False)
+        n += 1
+    meta = {
+        "rss": DEFAULT.__dict__, "shield_dmin": SHIELD_DEFAULT.__dict__,
+        "J_MAX": J_MAX, "A_PHYS_BRAKE": A_PHYS_BRAKE, "sim_dt": SIM_DT,
+        "reference": REFERENCE, "violation_t_range": VIOLATION_T_RANGE,
+        "schedule_files": sorted(p.name for p in SCHEDULE_DIR.glob("*.csv")),
+        "seeds": sorted(int(s) for s in outcomes["seed"].unique()),
+        "levels": sorted(float(x) for x in outcomes.get("beta", outcomes.get("gamma")).unique()),
+        "variants": sorted(outcomes["вариант"].unique()) if "вариант" in outcomes else None,
+        "code_version": code_version(), "logs_saved": n, **(params or {}),
+    }
+    (folder / "params.json").write_text(json.dumps(meta, ensure_ascii=False, indent=1, default=str))
+    return n
+
+
 # Контрфактическая проверка вмешательств фильтра
 MERGE_GAP = 1.0  # с: вмешательства с перерывом меньше этого считаем одним
 CF_HORIZON = 5.0  # с: сколько еще ехать без фильтра после конца вмешательства
@@ -170,12 +247,15 @@ def counterfactual_grid(logs, kind="brake", policy="idle", processes=None, trigg
     Возвращает DataFrame: одна строка — одно вмешательство.
     """
     tasks = []
-    for job, log in logs.items():
+    for key, log in logs.items():
+        job = key[:4]
         if not job[2]:  # без фильтра вмешательств нет
             continue
+        cfg = {**config, "emergency_brake": key[4]} if len(key) > 4 else config
         for iv in interventions(log).to_dict("records"):
-            iv.update(seed=job[0], level=job[1], shield=job[2], reaction_delay=job[3])
-            tasks.append((job, kind, policy, iv, trigger, config))
+            iv.update(seed=job[0], level=job[1], shield=job[2], reaction_delay=job[3],
+                      emergency_brake=cfg.get("emergency_brake", False))
+            tasks.append((job, kind, policy, iv, trigger, cfg))
     with ProcessPoolExecutor(processes) as pool:
         rows = list(pool.map(_cf_one, tasks))
     df = pd.DataFrame(rows)
