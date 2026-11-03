@@ -1,20 +1,33 @@
-"""Замер времени эпизодов и расчет объема прогонов.
+"""Замер времени эпизодов и план объема прогонов (письмо 29.10, п. 6, 9).
 
-time_episodes      — время эпизодов на одном ядре (последовательно);
-discordance        — доля сцен, где исход на двух уровнях разный (парное сравнение);
-episodes_needed    — сколько сцен нужно, чтобы ДИ парной разности был не шире ±w;
-min_detectable     — наименьшая разность, которую при n сценах можно назвать «хуже»;
-holm_z             — критическое значение с поправкой Холма в худшем случае;
-evaluation_plan    — сколько эпизодов в основной и дополнительной части.
+time_episodes        — время эпизодов на одном ядре (последовательно);
+discordance          — доля сцен, где исходы двух условий различаются;
+episodes_needed      — сколько сцен нужно, чтобы ДИ парной разности был не
+                       шире ±w ПРИ ИЗВЕСТНОЙ доле несовпадающих пар d;
+budget               — число эпизодов по частям: основной β, дополнительный γ,
+                       контрфактические прогоны — отдельно;
+projected_halfwidth  — какой будет полуширина ДИ при n сценах и k политиках,
+                       оценка повторной выборкой из исходов пробных политик;
+ppo_steps_per_second — скорость обучения PPO на целевой среде (с фильтром).
+
+Чего здесь больше нет и почему. Прежняя функция min_detectable считала
+границу, при которой приближенный ДИ становится положительным, в
+предположении, что все несовпадающие пары в одну сторону. Это не мощность
+обнаружения истинного эффекта, и вывод «500 сцен хватит для 2 п.п. после
+Холма» из нее не следует — он убран. Несовпадения между β и β = 1 у IDLE
+тоже не оценивают разброс будущего сравнения PPO с фильтром и без:
+это разные сравнения. Окончательный объем — после 2–3 пробных политик
+(projected_halfwidth на их исходах), сейчас только план.
 """
 
 import math
 import time
-from statistics import NormalDist
 
+import numpy as np
 import pandas as pd
 
-from rssrl.pilot import _policy, _run_one
+from rssrl.pilot import _run_one
+from rssrl.stats import crossed_bootstrap, percentile_ci
 
 
 def time_episodes(jobs, kind, policy="idle"):
@@ -39,91 +52,122 @@ def time_episodes(jobs, kind, policy="idle"):
 
 def discordance(a, b):
     """Доля пар (одна и та же сцена), где исходы a и b различаются.
-    a, b — булевы массивы одинаковой длины (например, столкновение
-    на уровне β и на уровне β = 1)."""
+    a, b — булевы массивы одинаковой длины."""
     a, b = pd.Series(a).astype(bool).to_numpy(), pd.Series(b).astype(bool).to_numpy()
     if len(a) != len(b):
         raise ValueError("нужны пары: одинаковые сцены на обоих уровнях")
     return float((a != b).mean())
 
 
-def holm_z(m, alpha=0.05):
-    """Двустороннее критическое значение z для самого строгого шага
-    поправки Холма из m сравнений (уровень alpha/m). Для объема берем
-    худший случай: интервал должен быть узким и при этом уровне."""
-    return NormalDist().inv_cdf(1 - alpha / (2 * m))
-
-
 def episodes_needed(d, half_width, z=1.96):
     """Сколько парных сцен нужно, чтобы половина ДИ разности частот
-    столкновений была не больше half_width.
+    столкновений была не больше half_width, если доля несовпадающих пар
+    равна d (одна политика, без разброса между политиками).
 
-    Для парных бинарных исходов дисперсия разности на одну сцену
-    d − δ², где d — доля несовпадающих пар, δ — сама разность.
-    Берем верхнюю оценку d (δ = 0): n = z² · d / w².
+    Дисперсия парной разности на одну сцену d − δ² ≤ d, отсюда
+    n = z² · d / w². d берется из пробных политик для того же сравнения,
+    для которого считается объем, а не из другого сравнения.
     """
     if d <= 0:
         return 0
     return math.ceil(z * z * d / (half_width * half_width))
 
 
-def min_detectable(n, z=1.96):
-    """Наименьшая разность частот δ, при которой весь ДИ разности > 0,
-    если все несовпадающие пары в одну сторону (d = δ, типично для
-    «нарушитель только добавляет столкновения»): z·sqrt((δ − δ²)/n) < δ,
-    откуда δ > z² / (n + z²)."""
-    return z * z / (n + z * z)
+def budget(n_scenes, n_policies, beta_levels=6, gamma_levels=4, delays=1, cf_scenes=100,
+           cf_per_episode=5.0, idm=True):
+    """Число эпизодов оценки по частям (каждая часть — свой бюджет).
 
-
-def evaluation_plan(n_scenes, n_policies, beta_levels=6, gamma_levels=4, delays=2):
-    """Сколько эпизодов в оценке после обучения PPO.
-
-    На каждую сцену и каждый уровень (β или γ):
-    - 2 политики PPO (обучена с фильтром / без) × n_policies seed обучения,
-      каждая проверяется с фильтром и без (перекрестная схема 2×2);
-    - IDM/MOBIL + RSS без RL — один вариант, seed обучения нет;
-    - каждый вариант с фильтром — при обеих задержках реакции.
-    Возвращает словарь с числом эпизодов по частям.
+    На каждую сцену и уровень (β или γ) — схема 2×2: политики «обучена с
+    фильтром» и «обучена без фильтра» по n_policies seed обучения, каждая
+    исполняется с фильтром и без; плюс IDM/MOBIL + RSS без RL (idm=True).
+    Варианты с фильтром — при delays задержках (1 — только основная ρ).
+    Контрфакт: cf_scenes сцен основного эксперимента × уровни β × варианты с
+    фильтром, по cf_per_episode контрфактических прогонов на эпизод (число
+    вмешательств — оценка из пилота).
     """
     ppo = 2 * n_policies
-    with_shield = (ppo + 1) * delays  # PPO с фильтром + IDM/MOBIL+RSS, обе задержки
-    without_shield = ppo
-    per_scene_level = with_shield + without_shield
-    levels = beta_levels + gamma_levels
+    with_shield = (ppo + (1 if idm else 0)) * delays
+    per_scene_level = with_shield + ppo
+    main = per_scene_level * beta_levels * n_scenes
+    extra = per_scene_level * gamma_levels * n_scenes
+    cf = with_shield * beta_levels * cf_scenes * cf_per_episode
     return {
         "эпизодов на сцену и уровень": per_scene_level,
-        "уровней": levels,
-        "эпизодов всего": per_scene_level * levels * n_scenes,
+        "основной β": main,
+        "дополнительный γ": extra,
+        "контрфакт": int(round(cf)),
     }
 
 
-def _training_env():
-    """Среда для замера скорости обучения: highway-v0 с нашим фоном.
-    Функция уровня модуля, чтобы ее можно было запустить в дочернем
-    процессе (там highway_env тоже нужно импортировать)."""
-    import gymnasium as gym
-    import highway_env  # noqa: F401  регистрирует highway-v0
+def projected_halfwidth(a, b, n_scenes, n_policies, paired_policies=False, n_rep=200, n_boot=400, seed=0,
+                        alpha=0.05):
+    """Оценка полуширины ДИ разности при n_scenes сценах и n_policies
+    политиках по исходам пробных политик.
 
-    from rssrl.scenarios import BACKGROUND
+    a, b — матрицы исходов пробных политик [политики × сцены] на общих сценах.
+    Из них n_rep раз собираем выборку нужного размера (сцены и политики с
+    возвращением; столбцы — общие) и считаем на ней перекрестный бутстреп
+    ДИ. Возвращает медиану полуширины. Чем больше разброс между пробными
+    политиками, тем меньше помогает увеличение числа сцен.
+    """
+    a, b = np.atleast_2d(np.asarray(a, float)), np.atleast_2d(np.asarray(b, float))
+    rng = np.random.default_rng(seed)
+    widths = []
+    for r in range(n_rep):
+        sc = rng.integers(a.shape[1], size=n_scenes)
+        pa = rng.integers(a.shape[0], size=n_policies)
+        pb = pa if paired_policies else rng.integers(b.shape[0], size=n_policies if b.shape[0] > 1 else 1)
+        boot = crossed_bootstrap(a[np.ix_(pa, sc)], b[np.ix_(pb, sc)], n_boot=n_boot, seed=seed + r,
+                                 paired_policies=paired_policies)
+        lo, hi = percentile_ci(boot, alpha)
+        widths.append((hi - lo) / 2)
+    return float(np.median(widths))
 
-    env = gym.make("highway-v0")
-    env.unwrapped.configure({"other_vehicles_type": BACKGROUND})
-    return env
 
+def ppo_steps_per_second(n_envs, steps=20_000, seed=0, shield=True):
+    """Скорость обучения PPO (stable-baselines3), шагов среды в секунду, на
+    целевой среде TrainingEnv (ShieldedVehicle с фильтром или без, фон
+    контролируемого следования) при n_envs параллельных средах. Шаг среды —
+    одно решение политики (1 с симуляции)."""
+    from functools import partial
 
-def ppo_steps_per_second(n_envs, steps=2048, seed=0):
-    """Скорость обучения PPO (stable-baselines3), шагов среды в секунду,
-    при n_envs параллельных средах. Шаг среды — одно решение политики."""
     from stable_baselines3 import PPO
     from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
 
-    fns = [_training_env] * n_envs
+    from rssrl.training import make_training_env
+
+    fns = [partial(make_training_env, shield=shield, worker=i) for i in range(n_envs)]
     env = SubprocVecEnv(fns) if n_envs > 1 else DummyVecEnv(fns)
     env.seed(seed)
-    model = PPO("MlpPolicy", env, n_steps=max(64, steps // n_envs), batch_size=64,
+    model = PPO("MlpPolicy", env, n_steps=max(64, 2048 // n_envs), batch_size=64,
                 seed=seed, verbose=0, device="cpu")
     t0 = time.perf_counter()
     model.learn(steps)
     elapsed = time.perf_counter() - t0
     env.close()
-    return steps / elapsed
+    return model.num_timesteps / elapsed
+
+
+def benchmark(out_csv, steps=4096, n_envs_list=(1, 8)):
+    """Бенчмарк пропускной способности PPO на целевой среде: шагов в секунду и
+    оценка часов на 10^5 шагов на политику, для политики с базовым фильтром и
+    без фильтра. Это замер скорости, а не обучение: модели не сохраняются.
+
+    Запускать отдельным процессом (python -m rssrl.volume <csv>): параллельные
+    среды SubprocVecEnv из ядра Jupyter на macOS зависают при запуске."""
+    rows = []
+    for shield in (True, False):
+        for n_envs in n_envs_list:
+            sps = ppo_steps_per_second(n_envs, steps=steps, shield=shield)
+            rows.append({"политика": "с базовым фильтром" if shield else "без фильтра", "сред": n_envs,
+                         "шагов в секунду": sps, "часов на 1e5 шагов на политику": 1e5 / sps / 3600})
+            print(rows[-1], flush=True)
+    df = pd.DataFrame(rows)
+    df.to_csv(out_csv, index=False)
+    return df
+
+
+if __name__ == "__main__":
+    import sys
+
+    benchmark(sys.argv[1], steps=int(sys.argv[2]) if len(sys.argv) > 2 else 4096)

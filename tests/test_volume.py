@@ -1,18 +1,10 @@
-"""Этап 7: формулы объема прогонов."""
+"""Объем прогонов и целевая среда обучения (rssrl/volume.py, rssrl/training.py)."""
 
 import numpy as np
 import pytest
 
-from rssrl.volume import discordance, episodes_needed, evaluation_plan, holm_z, min_detectable
-
-
-def test_holm_z_single_comparison_is_196():
-    assert holm_z(1) == pytest.approx(1.959964, abs=1e-5)
-
-
-def test_holm_z_grows_with_number_of_comparisons():
-    assert holm_z(10) > holm_z(5) > holm_z(1)
-    assert holm_z(10) == pytest.approx(2.807034, abs=1e-5)  # уровень 0,005 на хвост 0,0025
+from rssrl.training import TRAIN_SEED_OFFSET, TrainingEnv
+from rssrl.volume import budget, discordance, episodes_needed, projected_halfwidth
 
 
 def test_discordance_counts_differing_pairs():
@@ -37,7 +29,6 @@ def test_episodes_needed_gives_claimed_ci_width():
     n = episodes_needed(d, w)
     diffs = []
     for _ in range(4000):
-        # исходы пар: несовпадение с вероятностью d, знак — поровну
         u = rng.random(n)
         diff = np.where(u < d / 2, 1, np.where(u < d, -1, 0))
         diffs.append(diff.mean())
@@ -45,17 +36,43 @@ def test_episodes_needed_gives_claimed_ci_width():
     assert half <= w * 1.03
 
 
-def test_evaluation_plan_counts():
-    plan = evaluation_plan(n_scenes=100, n_policies=5)
-    # (2·5 + 1)·2 с фильтром + 2·5 без = 32 эпизода на сцену и уровень
-    assert plan["эпизодов на сцену и уровень"] == 32
-    assert plan["эпизодов всего"] == 32 * 10 * 100
+def test_budget_parts_are_separate():
+    b = budget(n_scenes=100, n_policies=3, delays=1, cf_scenes=50, cf_per_episode=2)
+    # 2·3 PPO с фильтром + IDM/MOBIL+RSS = 7 с фильтром, 6 без: 13 на сцену и уровень
+    assert b["эпизодов на сцену и уровень"] == 13
+    assert b["основной β"] == 13 * 6 * 100
+    assert b["дополнительный γ"] == 13 * 4 * 100
+    assert b["контрфакт"] == 7 * 6 * 50 * 2
 
 
-def test_min_detectable_is_the_boundary():
-    """При δ = min_detectable нижняя граница ДИ ровно 0, при большем δ — выше 0."""
-    n, z = 500, 3.0
-    delta = min_detectable(n, z)
-    lower = lambda d: d - z * np.sqrt((d - d * d) / n)
-    assert lower(delta) == pytest.approx(0.0, abs=1e-12)
-    assert lower(delta * 1.1) > 0 > lower(delta * 0.9)
+def test_projected_halfwidth_shrinks_with_scenes_and_grows_with_policy_spread():
+    rng = np.random.default_rng(0)
+    n = 400
+    same = np.tile((rng.random(n) < 0.1).astype(float), (3, 1))
+    varied = np.stack([(rng.random(n) < p).astype(float) for p in (0.02, 0.1, 0.3)])
+    base = np.zeros((1, n))
+    w_small = projected_halfwidth(same, base, 100, 3, n_rep=30, n_boot=200)
+    w_big = projected_halfwidth(same, base, 1000, 3, n_rep=30, n_boot=200)
+    assert w_big < w_small
+    w_varied = projected_halfwidth(varied, base, 1000, 3, n_rep=30, n_boot=200)
+    assert w_varied > 1.5 * w_big
+
+
+def test_training_env_is_target_system_and_seeds_do_not_overlap_evaluation():
+    env = TrainingEnv(shield=True)
+    obs, _ = env.reset(seed=0)
+    assert env.scene.ego.shield_enabled and not env.scene.ego.emergency_brake
+    assert env.scene.traffic == "following" and env.scene.kind == "nominal"
+    assert env.scene.seed >= TRAIN_SEED_OFFSET
+    seeds = {env.scene.seed}
+    for _ in range(3):
+        obs, r, term, trunc, _ = env.step(1)
+        assert env.observation_space.contains(obs.astype(env.observation_space.dtype))
+    env.reset()
+    seeds.add(env.scene.seed)
+    assert len(seeds) == 2
+    env.close()
+    env = TrainingEnv(shield=False)
+    env.reset(seed=0)
+    assert not env.scene.ego.shield_enabled
+    env.close()
