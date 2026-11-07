@@ -193,6 +193,11 @@ def test_lateral_dmin_is_enough_and_tight(v1, v2):
 JERK = RSSParams(jerk=10.0)
 
 
+def test_jerk_variant_keeps_zero_lower_bound():
+    """Ограничение снизу нулем [·]_+ из леммы: передняя намного быстрее."""
+    assert d_min_longitudinal(5, 40, JERK) == 0.0
+
+
 def test_jerk_variant_both_stopped_hand_example():
     # ρ-фаза: 3·0,5²/2 = 0,375 м, скорость 1,5 м/с.
     # Переход +3 -> -4 за τ = 0,7 с (машина за это время не останавливается):

@@ -447,6 +447,7 @@ class ShieldedVehicle(MDPVehicle):
         if not self.crashed:
             a = limit_jerk(self.action["acceleration"], self.a_prev, dt)
             # задом не едем: на последнем шаге торможения дотормаживаем до нуля
+            # (переход к покою, исключение из предела рывка, см. rssrl/dynamics.py)
             self.action["acceleration"] = max(a, -self.speed / dt)
         super().step(dt)
         self.a_prev = self.action["acceleration"]

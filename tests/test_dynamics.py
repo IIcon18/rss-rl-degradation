@@ -9,7 +9,7 @@ from rssrl.dynamics import A_PHYS_BRAKE, J_MAX, limit_jerk
 from rssrl.rss import DEFAULT
 from rssrl.scenarios import make_env
 from rssrl.shield import SIM_DT, ShieldedVehicle, brake_insufficient
-from rssrl.violators import BoundedIDMVehicle
+from rssrl.violators import BoundedIDMVehicle, _no_reverse
 
 LANE_W = 4.0
 
@@ -51,6 +51,17 @@ def test_background_acceleration_changes_no_faster_than_jerk_limit(seed):
                 assert abs(a - prev[id(v)]) <= J_MAX * SIM_DT + 1e-9
             prev[id(v)] = a
     env.close()
+
+
+def test_transition_to_rest_is_the_documented_exception():
+    """Письмо 07.11, п. 6: на шаге остановки изменение ускорения больше
+    J_MAX·dt, скорость становится ровно нулевой и не уходит в минус."""
+    a_prev, v = -4.0, 0.01
+    a = _no_reverse(limit_jerk(-4.0, a_prev, SIM_DT), v, SIM_DT)
+    assert abs(a - a_prev) > J_MAX * SIM_DT
+    assert v + a * SIM_DT == pytest.approx(0.0)
+    # пока скорости хватает, ограничение не срабатывает и предел рывка соблюден
+    assert _no_reverse(limit_jerk(-4.0, -3.0, SIM_DT), 5.0, SIM_DT) == pytest.approx(-3.0 - J_MAX * SIM_DT)
 
 
 # ---------- прогноз «хватит ли a_min_brake» ----------

@@ -33,7 +33,9 @@ from rssrl.rss import DEFAULT
 
 
 def _no_reverse(acceleration, speed, dt):
-    """Ускорение, при котором скорость за шаг dt не станет отрицательной."""
+    """Ускорение, при котором скорость за шаг dt не станет отрицательной.
+    Применяется после limit_jerk: на шаге перехода к покою изменение ускорения
+    может быть больше J_MAX·dt (исключение описано в rssrl/dynamics.py)."""
     return max(acceleration, -speed / dt)
 
 
