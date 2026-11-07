@@ -40,6 +40,13 @@
      слабее -a_min_brake, пока агент еще едет.
      Если удар случился раньше срока (ρ или ρ + TAU_JERK от t_danger),
      опоздание по этому признаку не засчитывается.
+     Профиль между командой и достижением торможения (_profile_violation)
+     проверяется независимо от исполнителя, по фактическому ускорению:
+     * на каждом шаге |Δa| <= J_MAX·dt, кроме шага перехода к покою;
+     * нет разгона после команды: ускорение не растет, а положительное
+       ускорение может только убывать (остаток разгона, который рывок не дает
+       снять мгновенно, допустим, удержание или набор — нет).
+     Нарушение профиля — тоже нарушение правильной реакции агента.
      Допуска «полшага» нет: t_danger, t_cmd и t_reached лежат на одной
      сетке шагов 1/15 с (начала шагов), поэтому разности — целое число
      шагов, и сравнение с ρ точное (допуск 1e-9 — только на округление
@@ -64,6 +71,7 @@ ACCEL_TOL = 0.05  # м/с^2
 TIME_TOL = 1e-9  # с, только округление суммы шагов в float
 STOP_V = 1e-6  # м/с: агент стоит
 CUTIN_TOL = 0.01  # относительный
+PROFILE_TOL = 1e-6  # м/с^2: округление float при сравнении ускорений соседних шагов
 
 AGENT, VIOLATOR, BOTH, UNKNOWN = "агент", "нарушитель", "оба", "не установлено"
 
@@ -97,6 +105,28 @@ def danger_onset(log, uid, dt=1 / 15):
     return float(rows["t"].iloc[first]) - dt, position, idx
 
 
+def _profile_violation(log, first, last, dt=1 / 15, j_max=None):
+    """Проверка профиля ускорения агента на строках лога first..last (метки
+    индекса): от шага команды до шага, где торможение достигнуто. Возвращает
+    (превышен рывок, был разгон после команды).
+
+    Ускорение шага сравнивается с прошлым шагом. Шаг, на котором агент
+    остановился (скорость стала нулевой), — переход к покою: там торможение
+    ограничено, чтобы не уехать назад, и предел рывка не проверяется."""
+    j_max = J_MAX if j_max is None else j_max
+    a = log["ego_a"].to_numpy(dtype=float)
+    v = log["ego_v"].to_numpy(dtype=float)
+    pos = log.index.get_indexer([first, last])
+    jerk_bad = accel_bad = False
+    for i in range(max(pos[0], 1), pos[1] + 1):
+        if v[i] <= STOP_V:
+            continue
+        da = a[i] - a[i - 1]
+        jerk_bad = jerk_bad or abs(da) > j_max * dt + PROFILE_TOL
+        accel_bad = accel_bad or da > PROFILE_TOL or (a[i] > PROFILE_TOL and da >= -PROFILE_TOL)
+    return jerk_bad, accel_bad
+
+
 def assign_responsibility(log, outcome, p=DEFAULT, dt=1 / 15):
     """Ответственность за столкновение эпизода (None, если столкновения нет).
 
@@ -121,7 +151,9 @@ def assign_responsibility(log, outcome, p=DEFAULT, dt=1 / 15):
     gamma_actual = outcome.get("gamma_actual", math.nan)
     if is_violator:
         if "vio_a" in log:
-            during = log.loc[idx] if idx else log.loc[:end]
+            # до физического шага удара включительно, даже если на нем партнер
+            # уже не отмечен как опасный (резервная ветвь danger_onset)
+            during = log.loc[idx[0]:end] if idx else log.loc[:end]
             # vio_violating_step: нарушитель исполнял нарушение на этом шаге
             # (строка лога пишется в конце шага; vio_violating к этому моменту
             # уже сброшен, если на этом шаге нарушитель остановился, а vio_a
@@ -139,7 +171,7 @@ def assign_responsibility(log, outcome, p=DEFAULT, dt=1 / 15):
     # агент
     tau_jerk = (p.a_max_accel + p.a_min_brake) / J_MAX
     reaction_cmd = reaction_actual = math.nan
-    late = late_actual = released = front_harsh = False
+    late = late_actual = released = front_harsh = jerk_bad = accel_bad = False
     if t_danger is not None:
         run = log.loc[idx]
         # сколько длилась опасная ситуация до удара (начало последнего шага):
@@ -147,8 +179,9 @@ def assign_responsibility(log, outcome, p=DEFAULT, dt=1 / 15):
         t_last = float(run["t"].iloc[-1]) - dt - t_danger
         if position == "ahead":
             braking = (run["a_executed"] <= -p.a_min_brake + 1e-9).to_numpy()
+            k_cmd = None
             if braking.any():
-                k = int(braking.argmax())
+                k = k_cmd = int(braking.argmax())
                 reaction_cmd = float(run["t"].iloc[k]) - dt - t_danger
                 late = reaction_cmd > p.rho + TIME_TOL
                 released = not braking[k:].all()
@@ -166,9 +199,12 @@ def assign_responsibility(log, outcome, p=DEFAULT, dt=1 / 15):
                 released = released or not after.all()
             else:
                 late_actual = t_last > p.rho + tau_jerk + TIME_TOL
+            if k_cmd is not None:
+                k_end = int(reached[k_cmd:].argmax()) + k_cmd if reached[k_cmd:].any() else len(run) - 1
+                jerk_bad, accel_bad = _profile_violation(log, run.index[k_cmd], run.index[k_end], dt)
         else:
             front_harsh = bool((run["ego_a"] < -p.a_max_brake - ACCEL_TOL).any())
-    agent_fault = late or late_actual or released or front_harsh
+    agent_fault = late or late_actual or released or front_harsh or jerk_bad or accel_bad
 
     if agent_fault and violator_fault:
         who = BOTH
@@ -190,6 +226,8 @@ def assign_responsibility(log, outcome, p=DEFAULT, dt=1 / 15):
         "agent_late_actual": late_actual,
         "agent_released": released,
         "agent_front_harsh": front_harsh,
+        "agent_jerk_violation": jerk_bad,
+        "agent_accel_after_command": accel_bad,
         "violator_min_accel": vio_min_a,
         "violator_harsh": harsh,
         "violator_cut_close": cut_close,

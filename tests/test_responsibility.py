@@ -134,6 +134,73 @@ def test_violator_harsh_braking_on_stopping_step_is_not_lost():
     assert r["violator_harsh"] and r["responsible"] == VIOLATOR
 
 
+def test_valid_profile_from_residual_acceleration_passes():
+    """Команда при остатке разгона +3 м/с^2: ускорение убывает с рывком J_MAX и
+    на этом пути еще положительно. Это допустимый профиль."""
+    n, cmd = 60, 36
+    a = np.zeros(n)
+    a[:cmd] = 3.0
+    for i in range(cmd, n):
+        a[i] = limit_jerk(-4.0, a[i - 1], DT)
+    r = assign_responsibility(fake_log(brake_from=cmd, ego_a=a), outcome())
+    assert not r["agent_jerk_violation"] and not r["agent_accel_after_command"]
+    assert r["responsible"] == UNKNOWN
+
+
+def test_long_acceleration_then_illegal_jump_is_caught():
+    """Письмо 07.11, п. 5: команда вовремя, ускорение держится +3 м/с^2 почти до
+    срока, потом скачок сразу на -4. Сроки соблюдены, профиль недопустим."""
+    a = np.zeros(60)
+    a[30:48] = 3.0  # 36-й шаг — команда (0,4 с), 48-й — скачок (1,2 с: срок ρ + 0,7)
+    a[48:] = -4.0
+    r = assign_responsibility(fake_log(brake_from=36, ego_a=a, crash_at=55), outcome())
+    assert not r["agent_late"] and not r["agent_late_actual"]
+    assert r["agent_jerk_violation"] and r["agent_accel_after_command"]
+    assert r["responsible"] == AGENT
+
+
+def test_acceleration_growing_after_command_is_caught():
+    a = np.zeros(60)
+    a[37:40] = [0.3, 0.6, 0.9]
+    for i in range(40, 60):
+        a[i] = limit_jerk(-4.0, a[i - 1], DT)
+    r = assign_responsibility(fake_log(brake_from=36, ego_a=a, crash_at=58), outcome())
+    assert r["agent_accel_after_command"] and not r["agent_jerk_violation"]
+    assert r["responsible"] == AGENT
+
+
+def test_jump_to_braking_without_acceleration_is_jerk_violation():
+    a = np.zeros(60)
+    a[36:] = -4.0  # мгновенно от 0 до -4
+    r = assign_responsibility(fake_log(brake_from=36, ego_a=a), outcome())
+    assert r["agent_jerk_violation"] and not r["agent_accel_after_command"]
+    assert r["responsible"] == AGENT
+
+
+def test_transition_to_rest_is_exempt_from_jerk_check():
+    """На шаге остановки ускорение скачком идет от торможения к малому значению,
+    чтобы скорость стала ровно нулевой. Это не нарушение профиля."""
+    log = fake_log(brake_from=36)
+    log.loc[39, "ego_a"] = -1.0  # слабее, чем на прошлом шаге: дотормаживание до нуля
+    log.loc[39:, "ego_v"] = 0.0
+    log.loc[40:, "ego_a"] = 0.0
+    r = assign_responsibility(log, outcome())
+    assert not r["agent_jerk_violation"] and not r["agent_accel_after_command"]
+
+
+def test_fallback_keeps_impact_step_for_violator_braking():
+    """Письмо 07.11, п. 5: на шаге удара партнер уже не отмечен опасным (резервная
+    ветвь), а единственное торможение сильнее a_max_brake — как раз на этом шаге."""
+    log = fake_log(brake_from=36, vio_a=-5.0)
+    log.at[50, "danger_ahead_ids"] = []
+    log.loc[50, "vio_a"] = -10.0
+    t, _, idx = danger_onset(log, VIO)
+    assert t == pytest.approx(30 * DT) and idx[-1] == 49
+    r = assign_responsibility(log, outcome())
+    assert r["violator_harsh"] and r["violator_min_accel"] == -10.0
+    assert r["responsible"] == VIOLATOR
+
+
 def test_released_brake_while_dangerous_is_agent_fault():
     r = assign_responsibility(fake_log(brake_from=33, release_at=45), outcome())
     assert r["responsible"] == AGENT and r["agent_released"]
