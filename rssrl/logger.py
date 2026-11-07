@@ -8,7 +8,8 @@ EpisodeLogger подключается к дороге и после каждо�
   вмешался ли фильтр;
 - нарушитель (если есть): скорость, фактическое ускорение, зазор до агента,
   тормозит ли он сейчас;
-- столкновение и с кем.
+- столкновение и с кем: партнер — машина, с которой у агента есть фактический
+  контакт (см. _contacts), в том числе уже разбитая раньше.
 Фактические ускорения считаются по изменению скорости за шаг.
 """
 
@@ -31,7 +32,7 @@ class EpisodeLogger:
         self._prev_vio_speed = None
         if violator is not None:
             self.set_violator(violator)
-        self._crashed_before = {id(v) for v in self.road.vehicles if v.crashed}
+        self._will_touch = []  # uid машин, с которыми контакт предсказан на прошлом шаге
         # дорога после своего шага вызывает record()
         original_step = self.road.step
 
@@ -54,6 +55,28 @@ class EpisodeLogger:
         dist = s_v - s_ego
         half = (self.ego.LENGTH + vehicle.LENGTH) / 2
         return dist - half if dist >= 0 else dist + half
+
+    def _contacts(self):
+        """Машины, с которыми у агента контакт сейчас (многоугольники кузовов
+        пересекаются), и машины, с которыми он будет на следующем шаге.
+
+        highway-env ставит crashed двумя путями: кузова уже пересеклись, или на
+        прошлом шаге пересечение было предсказано, и на этом шаге машины
+        раздвинуты импульсом impact (тогда сейчас кузова могут не пересекаться).
+        Поэтому партнер на шаге удара — объединение текущего контакта и
+        предсказанного на прошлом шаге. Был ли партнер разбит раньше, не важно."""
+        now, soon = [], []
+        for v in self.road.vehicles:
+            if v is self.ego:
+                continue
+            uid = getattr(v, "uid", None)
+            hit_a, will_a, _ = self.ego._is_colliding(v, self.dt)
+            hit_b, will_b, _ = v._is_colliding(self.ego, self.dt)
+            if hit_a or hit_b:
+                now.append(uid)
+            if will_a or will_b:
+                soon.append(uid)
+        return now, soon
 
     def record(self):
         self.t += self.dt
@@ -89,17 +112,11 @@ class EpisodeLogger:
             )
             self._prev_vio_speed = vx
 
+        touching, will_touch = self._contacts()
         if ego.crashed and self.crash_partners is None:
-            # с кем столкнулись: машины, разбившиеся на этом же шаге рядом с агентом
-            new = [
-                v
-                for v in self.road.vehicles
-                if v is not ego and v.crashed and id(v) not in self._crashed_before
-                and abs(v.position[0] - ego.position[0]) < 15
-            ]
-            self.crash_partners = [getattr(v, "uid", None) for v in new]
+            self.crash_partners = touching + [u for u in self._will_touch if u not in touching]
             row["crash_partners"] = self.crash_partners
-        self._crashed_before = {id(v) for v in self.road.vehicles if v.crashed}
+        self._will_touch = will_touch
         self.rows.append(row)
 
     def frame(self):

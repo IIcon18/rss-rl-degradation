@@ -5,7 +5,8 @@ import pandas as pd
 import pytest
 
 from rssrl.pilot import _run_one, counterfactual, interventions
-from rssrl.scenarios import STOP_DURATION, classify_outcome
+from rssrl.responsibility import AGENT, assign_responsibility
+from rssrl.scenarios import STOP_DURATION, classify_outcome, make_scene, run_episode
 from rssrl.schedules import build_schedules, save_schedules
 
 DT = 1 / 15
@@ -171,3 +172,54 @@ def test_counterfactual_with_schedule_matches_original(sched_file):
     n = int((log["t"] <= iv.t_start + 1e-9).sum())
     pd.testing.assert_series_equal(log["ego_x"].iloc[:n], cf_log["ego_x"].iloc[:n])
     assert log["vio_v"].first_valid_index() == cf_log["vio_v"].first_valid_index()
+
+
+def _stopped_car_ahead(scene, gap, crashed):
+    """Поставить машину фона стоять в полосе агента на gap метров впереди."""
+    ego = scene.ego
+    road = scene.env.unwrapped.road
+    car = next(v for v in road.vehicles if v is not ego)
+    car.position = ego.position + [gap + ego.LENGTH, 0.0]
+    car.heading, car.speed, car.lane_index = ego.heading, 0.0, ego.lane_index
+    car.lane = ego.lane
+    car.crashed = crashed
+    if crashed:
+        car.check_collisions = True
+    return car
+
+
+@pytest.mark.parametrize("crashed_before", [True, False])
+def test_partner_found_by_contact_even_if_already_wrecked(crashed_before):
+    """Письмо 07.11, п. 4: агент въезжает в стоящую машину, уже разбитую раньше.
+    Она не получает признак столкновения впервые, но контакт фактический."""
+    scene = make_scene(0, kind="nominal", shield=False)
+    car = _stopped_car_ahead(scene, 30.0, crashed_before)
+    o, log = run_episode(scene)
+    assert o["collision"]
+    assert o["crash_partners"] == [car.uid]
+
+
+def test_secondary_collision_gets_agent_reaction_check():
+    """Со вторичным столкновением партнер определен, поэтому реакция агента
+    проверяется, а не пропускается из-за пустого списка."""
+    scene = make_scene(0, kind="nominal", shield=False)
+    car = _stopped_car_ahead(scene, 30.0, True)
+    o, log = run_episode(scene)
+    r = assign_responsibility(log, o)
+    assert r["partner"] == car.uid
+    assert r["t_danger"] is not None and r["responsible"] == AGENT and r["agent_late"]
+
+
+def test_car_nearby_without_contact_is_not_a_partner():
+    """Соседняя машина рядом, разбитая на том же шаге не с агентом, партнером не считается."""
+    scene = make_scene(0, kind="nominal", shield=False)
+    road = scene.env.unwrapped.road
+    ego = scene.ego
+    others = [v for v in road.vehicles if v is not ego]
+    car = _stopped_car_ahead(scene, 30.0, False)
+    bystander = others[1]
+    bystander.position = ego.position + [30.0, 4.0]
+    bystander.heading, bystander.speed = ego.heading, 0.0
+    bystander.crashed = True
+    o, _ = run_episode(scene)
+    assert o["crash_partners"] == [car.uid]
