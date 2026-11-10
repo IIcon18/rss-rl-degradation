@@ -20,7 +20,19 @@ ppo_steps_per_second — скорость обучения PPO на целево
 (projected_halfwidth на их исходах), сейчас только план.
 """
 
+import os
+
+# до импорта numpy: иначе BLAS уже выберет число потоков по числу ядер, и
+# параллельные процессы (SubprocVecEnv, несколько одновременных обучений)
+# будут драться за потоки (настройка параллельности, письмо 07.11,
+# Windows-ПК — AMD Ryzen 5 3600, 6 ядер / 12 потоков).
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+
+import json
 import math
+import subprocess
+import sys
 import time
 
 import numpy as np
@@ -124,31 +136,50 @@ def projected_halfwidth(a, b, n_scenes, n_policies, paired_policies=False, n_rep
     return float(np.median(widths))
 
 
-def ppo_steps_per_second(n_envs, steps=20_000, seed=0, shield=True):
+def ppo_steps_per_second(n_envs, steps=20_000, seed=0, shield=True, seconds=None):
     """Скорость обучения PPO (stable-baselines3), шагов среды в секунду, на
     целевой среде TrainingEnv (ShieldedVehicle с фильтром или без, фон
     контролируемого следования) при n_envs параллельных средах. Шаг среды —
-    одно решение политики (1 с симуляции)."""
+    одно решение политики (1 с симуляции). GPU не используется (device="cpu").
+
+    Если seconds задан — вместо фиксированного числа шагов обучение идет,
+    пока не истечет это время (замер пропускной способности на вариант
+    фиксированной длительности, а не фиксированного объема)."""
     from functools import partial
 
     from stable_baselines3 import PPO
+    from stable_baselines3.common.callbacks import BaseCallback
     from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
 
-    from rssrl.training import make_training_env
+    from rssrl.training import limit_threads, make_training_env
+
+    limit_threads()  # начало главного процесса (torch.set_num_threads(1) + OMP/MKL)
 
     fns = [partial(make_training_env, shield=shield, worker=i) for i in range(n_envs)]
     env = SubprocVecEnv(fns) if n_envs > 1 else DummyVecEnv(fns)
     env.seed(seed)
     model = PPO("MlpPolicy", env, n_steps=max(64, 2048 // n_envs), batch_size=64,
                 seed=seed, verbose=0, device="cpu")
+
+    class _TimeLimit(BaseCallback):
+        def __init__(self, deadline):
+            super().__init__()
+            self.deadline = deadline
+
+        def _on_step(self):
+            return time.perf_counter() < self.deadline
+
     t0 = time.perf_counter()
-    model.learn(steps)
+    if seconds is None:
+        model.learn(steps)
+    else:
+        model.learn(10**9, callback=_TimeLimit(t0 + seconds))
     elapsed = time.perf_counter() - t0
     env.close()
     return model.num_timesteps / elapsed
 
 
-def benchmark(out_csv, steps=4096, n_envs_list=(1, 8)):
+def benchmark(out_csv, steps=4096, n_envs_list=(1, 8), seconds=None):
     """Бенчмарк пропускной способности PPO на целевой среде: шагов в секунду и
     оценка часов на 10^5 шагов на политику, для политики с базовым фильтром и
     без фильтра. Это замер скорости, а не обучение: модели не сохраняются.
@@ -158,7 +189,7 @@ def benchmark(out_csv, steps=4096, n_envs_list=(1, 8)):
     rows = []
     for shield in (True, False):
         for n_envs in n_envs_list:
-            sps = ppo_steps_per_second(n_envs, steps=steps, shield=shield)
+            sps = ppo_steps_per_second(n_envs, steps=steps, shield=shield, seconds=seconds)
             rows.append({"политика": "с базовым фильтром" if shield else "без фильтра", "сред": n_envs,
                          "шагов в секунду": sps, "часов на 1e5 шагов на политику": 1e5 / sps / 3600})
             print(rows[-1], flush=True)
@@ -167,7 +198,47 @@ def benchmark(out_csv, steps=4096, n_envs_list=(1, 8)):
     return df
 
 
-if __name__ == "__main__":
-    import sys
+def _single_run_cli(out_json, shield, n_envs, seconds, seed=0):
+    """Один замер шагов/с с заданной длительностью, результат — в JSON.
+    Используется как дочерний процесс для измерения одновременных обучений
+    (двух процессов PPO.learn в параллель)."""
+    sps = ppo_steps_per_second(n_envs, shield=shield, seconds=seconds, seed=seed)
+    with open(out_json, "w") as f:
+        json.dump({"shield": shield, "n_envs": n_envs, "seconds": seconds, "steps_per_second": sps}, f)
 
-    benchmark(sys.argv[1], steps=int(sys.argv[2]) if len(sys.argv) > 2 else 4096)
+
+def concurrent_benchmark(n_envs_each=5, seconds=150, shield=True, out_dir="."):
+    """Пропускная способность при двух одновременных обучениях (по n_envs_each
+    сред каждое) — отдельные процессы python, а не потоки/подпроцессы одного
+    SubprocVecEnv, чтобы увидеть реальную конкуренцию за 12 потоков. Возвращает
+    суммарные шагов/с по двум процессам."""
+    paths = [os.path.join(out_dir, f"_concurrent_{i}.json") for i in range(2)]
+    procs = [
+        subprocess.Popen([sys.executable, "-m", "rssrl.volume", "--single", paths[i],
+                          str(shield), str(n_envs_each), str(seconds), str(i)])
+        for i in range(2)
+    ]
+    for p in procs:
+        p.wait()
+    results = []
+    for path in paths:
+        with open(path) as f:
+            results.append(json.load(f))
+        os.remove(path)
+    total_sps = sum(r["steps_per_second"] for r in results)
+    return {"политика": "с базовым фильтром" if shield else "без фильтра",
+            "схема": f"2×{n_envs_each} сред одновременно", "сред всего": 2 * n_envs_each,
+            "шагов в секунду": total_sps, "часов на 1e5 шагов на политику": 1e5 / total_sps / 3600}
+
+
+if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "--single":
+        # дочерний процесс concurrent_benchmark: --single out.json shield n_envs seconds seed
+        _single_run_cli(sys.argv[2], sys.argv[3] == "True", int(sys.argv[4]), float(sys.argv[5]),
+                        seed=int(sys.argv[6]))
+    elif len(sys.argv) > 1 and sys.argv[1] == "--grid":
+        # --grid out.csv seconds env1,env2,...
+        benchmark(sys.argv[2], seconds=float(sys.argv[3]),
+                  n_envs_list=tuple(int(x) for x in sys.argv[4].split(",")))
+    else:
+        benchmark(sys.argv[1], steps=int(sys.argv[2]) if len(sys.argv) > 2 else 4096)

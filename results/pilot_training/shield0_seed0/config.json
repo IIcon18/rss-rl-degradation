@@ -1,0 +1,14 @@
+{
+ "shield": false,
+ "seed": 0,
+ "n_envs": 12,
+ "total_timesteps": 100000,
+ "n_steps": 170,
+ "batch_size": 120,
+ "eval_seed": 10000,
+ "eval_n_envs": 4,
+ "n_eval_episodes": 10,
+ "eval_every_steps": 10000,
+ "device": "cpu",
+ "model_selection": "best mean reward on eval scenes during training"
+}

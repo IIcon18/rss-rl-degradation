@@ -1,0 +1,33 @@
+{
+ "runs": [
+  {
+   "name": "shield1_seed0",
+   "shield": true,
+   "seed": 0,
+   "elapsed_s": 9007.049091699999,
+   "steps_per_second": 11.32446364636705
+  },
+  {
+   "name": "shield1_seed1",
+   "shield": true,
+   "seed": 1,
+   "elapsed_s": 9002.43015460018,
+   "steps_per_second": 11.3302739647337
+  },
+  {
+   "name": "shield0_seed0",
+   "shield": false,
+   "seed": 0,
+   "elapsed_s": 9007.028960800264,
+   "steps_per_second": 11.324488956782195
+  },
+  {
+   "name": "shield0_seed1",
+   "shield": false,
+   "seed": 1,
+   "elapsed_s": 9161.732591700274,
+   "steps_per_second": 11.133265349002114
+  }
+ ],
+ "total_elapsed_s": 36231.62447379995
+}

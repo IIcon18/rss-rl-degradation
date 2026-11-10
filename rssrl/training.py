@@ -16,11 +16,27 @@ TrainingEnv — та же система, что и в оценке: машин�
 Seed сцен обучения не пересекаются с seed сцен оценки: TRAIN_SEED_OFFSET.
 """
 
+import os
+
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+
 import gymnasium as gym
 
 from rssrl.scenarios import RHO, make_scene
 
 TRAIN_SEED_OFFSET = 1_000_000  # сцены оценки — 0..N, сцены обучения — от миллиона
+
+
+def limit_threads():
+    """Ограничить потоки BLAS/torch до 1 на процесс: вызывается в начале
+    главного процесса и внутри фабрики среды в каждом подпроцессе
+    SubprocVecEnv, чтобы несколько процессов на 12 потоках не конкурировали
+    за одни и те же ядра."""
+    os.environ["OMP_NUM_THREADS"] = "1"
+    os.environ["MKL_NUM_THREADS"] = "1"
+    import torch
+    torch.set_num_threads(1)
 
 
 class TrainingEnv(gym.Env):
@@ -62,5 +78,7 @@ class TrainingEnv(gym.Env):
 
 def make_training_env(shield=True, worker=0, **kwargs):
     """Фабрика для векторных сред stable-baselines3 (функция модуля, чтобы
-    ее можно было передать в дочерний процесс)."""
+    ее можно было передать в дочерний процесс). Вызывается внутри каждого
+    подпроцесса SubprocVecEnv — здесь же ограничиваем его потоки."""
+    limit_threads()
     return TrainingEnv(shield=shield, worker=worker, **kwargs)
