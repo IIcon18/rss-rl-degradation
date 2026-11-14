@@ -1,0 +1,11 @@
+{
+ "n_scenes": 100,
+ "seed_offset": 2000000,
+ "runs": [
+  "shield0_seed0",
+  "shield0_seed1",
+  "shield1_seed0",
+  "shield1_seed1"
+ ],
+ "code_version": "de06798-dirty"
+}
