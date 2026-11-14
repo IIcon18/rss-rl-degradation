@@ -17,9 +17,16 @@
 - Оценка во время обучения — на отдельном потоке сцен (EVAL_SEED_OFFSET,
   непересекающемся с seed обучения), 4 среды, по N_EVAL_EPISODES эпизодов,
   раз в EVAL_EVERY_STEPS шагов среды.
-- Правило выбора модели: лучшая по среднему эпизодному вознаграждению на
-  этих сценах оценки за все время обучения (EvalCallback,
-  best_model_save_path) — не последняя по времени модель.
+- Правило выбора модели для ЭТОГО пилота: лучшая по среднему эпизодному
+  вознаграждению на этих сценах оценки за все время обучения (EvalCallback,
+  best_model_save_path). Письмо 14.11: для основной серии принято другое
+  общее правило — последний чекпойнт (final_model), см. CLAUDE.md; эту
+  документацию и конфиги уже прошедшего пилота задним числом не меняем,
+  в манифест (rssrl/manifest.py) и преподавателю идет final_model.
+- INFO_KEYWORDS (добавлено письмом 14.11, п. 2, после пилота): причина
+  окончания эпизода и доля времени вмешательства фильтра — в monitor.csv.
+  Это инфраструктура для основной серии, уже прошедший пилот не
+  перезапускаем, его monitor.csv этих колонок не содержит.
 
 Прогоны идут по очереди (не параллельно друг другу): по замеру это дает
 то же суммарное время, что и параллельный запуск нескольких обучений
@@ -53,6 +60,9 @@ N_EVAL_EPISODES = 10
 EVAL_EVERY_STEPS = 10_000  # в шагах среды (не в вызовах callback)
 N_STEPS = 2048 // N_ENVS  # 170: размер буфера на среду за один проход PPO
 BATCH_SIZE = 120  # N_STEPS * N_ENVS = 2040, делится без остатка (2040 / 120 = 17)
+# причина окончания эпизода и доля времени вмешательства фильтра — в monitor.csv
+# (письмо 14.11, п. 2); пилот с этими полями не перезапускаем, они для основной серии
+INFO_KEYWORDS = ("outcome", "collision", "offroad", "shield_frac")
 
 RESULTS_DIR = Path("results/pilot_training")
 MODELS_DIR = Path("models/pilot_training")
@@ -81,13 +91,13 @@ def run_one(shield, seed, total_timesteps=TOTAL_TIMESTEPS, n_envs=N_ENVS, verbos
     def make_train(i):
         def _init():
             env = make_training_env(shield=shield, worker=i)
-            return Monitor(env, filename=str(out_dir / f"train_worker{i}"))
+            return Monitor(env, filename=str(out_dir / f"train_worker{i}"), info_keywords=INFO_KEYWORDS)
         return _init
 
     def make_eval(i):
         def _init():
             env = make_training_env(shield=shield, worker=i)
-            return Monitor(env, filename=str(out_dir / f"eval_worker{i}"))
+            return Monitor(env, filename=str(out_dir / f"eval_worker{i}"), info_keywords=INFO_KEYWORDS)
         return _init
 
     train_env = SubprocVecEnv([make_train(i) for i in range(n_envs)])

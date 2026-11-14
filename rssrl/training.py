@@ -23,7 +23,7 @@ os.environ.setdefault("MKL_NUM_THREADS", "1")
 
 import gymnasium as gym
 
-from rssrl.scenarios import RHO, make_scene
+from rssrl.scenarios import RHO, classify_outcome, make_scene
 
 TRAIN_SEED_OFFSET = 1_000_000  # сцены оценки — 0..N, сцены обучения — от миллиона
 
@@ -70,7 +70,25 @@ class TrainingEnv(gym.Env):
         return obs, {}
 
     def step(self, action):
-        return self.scene.env.step(action)
+        obs, reward, terminated, truncated, info = self.scene.env.step(action)
+        if terminated or truncated:
+            # причина окончания эпизода и вмешательства фильтра (письмо
+            # 14.11, п. 2): нужны и для обучения, и для оценки во время
+            # обучения (eval_env — та же TrainingEnv). Старые прогоны
+            # пилота этих полей не содержат и задним числом не
+            # перезапускаются, это инфраструктура для основной серии.
+            log = self.scene.logger.frame()
+            outcome, t_standing = classify_outcome(log)
+            info = {
+                **info,
+                "outcome": outcome,
+                "collision": outcome == "collision",
+                "offroad": outcome == "offroad",
+                "t_standing": t_standing,
+                "shield_steps": int(log["shield_active"].sum()),
+                "shield_frac": float(log["shield_active"].mean()) if len(log) else 0.0,
+            }
+        return obs, reward, terminated, truncated, info
 
     def close(self):
         self.scene.env.close()
