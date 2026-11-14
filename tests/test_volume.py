@@ -4,7 +4,8 @@ import numpy as np
 import pytest
 
 from rssrl.training import TRAIN_SEED_OFFSET, TrainingEnv
-from rssrl.volume import budget, discordance, episodes_needed, projected_halfwidth
+from rssrl.volume import (budget, discordance, episodes_needed, family_a_power, family_a_precision,
+                          projected_halfwidth, step_effect)
 
 
 def test_discordance_counts_differing_pairs():
@@ -76,3 +77,47 @@ def test_training_env_is_target_system_and_seeds_do_not_overlap_evaluation():
     env.reset(seed=0)
     assert not env.scene.ego.shield_enabled
     env.close()
+
+
+def test_step_effect_is_flat_before_onset_and_shifted_after():
+    effect = step_effect(1.4, 0.05, baseline=0.03)
+    assert effect(1.0) == (0.03, 0.03)
+    assert effect(1.2) == (0.03, 0.03)
+    assert effect(1.4) == pytest.approx((0.08, 0.03))
+    assert effect(2.0) == pytest.approx((0.08, 0.03))
+
+
+def test_family_a_power_is_high_for_large_effect_and_many_scenes():
+    """Явно отклоняемый эффект (большая дельта, много сцен, политики
+    одинаковы) — процедура почти всегда находит именно этот порог."""
+    effect = step_effect(1.4, 0.1, baseline=0.02)
+    df = family_a_power(effect, 1.4, [3], [800], policy_spread=0.0, n_rep=25, n_boot=400, seed=1)
+    assert df["мощность"].iloc[0] > 0.8
+
+
+def test_family_a_power_is_near_zero_for_tiny_effect_and_few_scenes():
+    effect = step_effect(1.4, 0.005, baseline=0.02)
+    df = family_a_power(effect, 1.4, [2], [50], policy_spread=0.0, n_rep=25, n_boot=400, seed=1)
+    assert df["мощность"].iloc[0] < 0.3
+
+
+def test_family_a_power_null_effect_mostly_finds_no_threshold():
+    """Под нулевым эффектом (эффект включается только выше сетки) правило
+    почти всегда корректно возвращает «не установлено» — это допустимый и
+    здесь даже ожидаемый исход, а не брак симуляции."""
+    null = step_effect(10.0, 0.0, baseline=0.02)
+    df = family_a_power(null, None, [3], [300], policy_spread=0.0, n_rep=25, n_boot=400, seed=2)
+    assert df["мощность"].iloc[0] > 0.8
+
+
+def test_family_a_power_decreases_with_policy_spread():
+    effect = step_effect(1.4, 0.06, baseline=0.02)
+    low = family_a_power(effect, 1.4, [3], [500], policy_spread=0.0, n_rep=25, n_boot=400, seed=3)
+    high = family_a_power(effect, 1.4, [3], [500], policy_spread=0.03, n_rep=25, n_boot=400, seed=3)
+    assert high["мощность"].iloc[0] <= low["мощность"].iloc[0]
+
+
+def test_family_a_precision_shrinks_with_more_scenes():
+    small = family_a_precision(3, 100, n_rep=25, n_boot=400, seed=0)
+    big = family_a_precision(3, 800, n_rep=25, n_boot=400, seed=0)
+    assert big < small

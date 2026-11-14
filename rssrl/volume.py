@@ -8,7 +8,18 @@ budget               — число эпизодов по частям: осно
                        контрфактические прогоны — отдельно;
 projected_halfwidth  — какой будет полуширина ДИ при n сценах и k политиках,
                        оценка повторной выборкой из исходов пробных политик;
-ppo_steps_per_second — скорость обучения PPO на целевой среде (с фильтром).
+ppo_steps_per_second — скорость обучения PPO на целевой среде (с фильтром);
+family_a_power       — письмо 14.11, п. 4: симуляцией — вероятность, что
+                       ВСЕ правило семьи A (поправка Холма по 6 сравнениям +
+                       подтверждение «хуже» на следующем β, rssrl.stats.
+                       decide_family + family_threshold) сработает при
+                       заданном эффекте. projected_halfwidth считает
+                       полуширину ОДНОГО интервала и такого расчета не
+                       заменяет (замечание преподавателя, письмо 14.11);
+family_a_precision   — альтернатива по точности: медианная полуширина
+                       СОВМЕСТНОГО интервала семьи (уровень 1 − alpha/m,
+                       как ci_simult в decide_family), а не обычного 95%
+                       интервала по умолчанию.
 
 Чего здесь больше нет и почему. Прежняя функция min_detectable считала
 границу, при которой приближенный ДИ становится положительным, в
@@ -39,7 +50,9 @@ import numpy as np
 import pandas as pd
 
 from rssrl.pilot import _run_one
-from rssrl.stats import crossed_bootstrap, percentile_ci
+from rssrl.stats import ALPHA, MARGIN, crossed_bootstrap, decide_family, family_threshold, percentile_ci
+
+FAMILY_A_LEVELS = (1.0, 1.2, 1.4, 1.6, 1.8, 2.0)  # как в rssrl.stats.COMPARISONS, семья A
 
 
 def time_episodes(jobs, kind, policy="idle"):
@@ -229,6 +242,120 @@ def concurrent_benchmark(n_envs_each=5, seconds=150, shield=True, out_dir="."):
     return {"политика": "с базовым фильтром" if shield else "без фильтра",
             "схема": f"2×{n_envs_each} сред одновременно", "сред всего": 2 * n_envs_each,
             "шагов в секунду": total_sps, "часов на 1e5 шагов на политику": 1e5 / total_sps / 3600}
+
+
+# ---------------------------------------------------------------------------
+# Объем для семьи A (письмо 14.11, п. 4): мощность всего правила семьи
+# (Холм по 6 сравнениям + подтверждение «хуже» на следующем β) симуляцией,
+# и отдельно — точность на уровне совместного интервала семьи.
+#
+# Диагностика (rssrl/diagnostics.py) — номинальный режим, нарушителя нет, и
+# там частота столкновений с фильтром около нуля (tests/test_nominal.py). Она
+# НЕ может дать оценку разброса между обучениями именно для вероятности
+# столкновения при нарушении — такой величины в проекте пока ни у кого нет
+# (основной β-эксперимент еще не проводился). Поэтому здесь разброс между
+# политиками одного типа — ПРЕДПОЛАГАЕМЫЙ параметр модели (policy_spread,
+# бета-биномиальная надстройка), не оценка из данных; задается сеткой
+# значений для анализа чувствительности, как и сам эффект. Диагностика дает
+# «полезную первичную информацию» (письмо 14.11) в другом смысле: по двум
+# seed на тип видно, что политики одного типа уже по-разному ведут себя в
+# номинале (скорость, зазор/d_min, доля вмешательств фильтра) — качественное
+# основание, что между обучениями вообще есть разброс, но не его величину
+# для столкновений при нарушении.
+# ---------------------------------------------------------------------------
+
+def _draw_policy_probs(mean, std, n_policies, rng):
+    """n_policies вероятностей столкновения политик одного типа: бета-
+    распределение со средним mean и стандартным отклонением std (между
+    обучениями), std=0 — все политики одного типа имеют одну и ту же
+    вероятность (нижняя граница разброса)."""
+    mean = min(max(mean, 0.0), 1.0)
+    if std <= 0 or mean <= 0 or mean >= 1:
+        return np.full(n_policies, mean)
+    max_var = mean * (1 - mean)
+    var = min(std * std, max_var * 0.98)
+    common = mean * (1 - mean) / var - 1
+    a, b = max(mean * common, 1e-6), max((1 - mean) * common, 1e-6)
+    return rng.beta(a, b, size=n_policies)
+
+
+def step_effect(beta_onset, delta, baseline=0.03, levels=FAMILY_A_LEVELS):
+    """Предполагаемый эффект: PPO_N−R (без фильтра) держит постоянную
+    частоту столкновений baseline на всех уровнях сетки; PPO_S+R (с
+    фильтром) — baseline при beta < beta_onset и baseline + delta начиная с
+    beta_onset (ступенька, не нарастание: при бесконечных данных порог
+    процедуры для такого эффекта — ровно beta_onset, если beta_onset не
+    верхняя точка сетки, см. rssrl.stats.beta_star). Возвращает функцию
+    beta -> (p_s, p_n)."""
+    def effect(beta):
+        p_n = baseline
+        p_s = baseline + (delta if beta >= beta_onset - 1e-9 else 0.0)
+        return min(p_s, 1.0), min(p_n, 1.0)
+    return effect
+
+
+def _simulate_family_a_once(effect, n_policies, n_scenes, policy_spread, rng, levels=FAMILY_A_LEVELS,
+                            alpha=ALPHA, margin=MARGIN, n_boot=2000):
+    """Один повтор: для каждого beta сетки разыгрываем n_policies политик
+    (свои вероятности из _draw_policy_probs) x n_scenes сцен для PPO_S+R и
+    PPO_N−R, считаем decide_family по всей семье сразу (поправка Холма по
+    всем 6 уровням за один вызов, как и положено). Возвращает (β*, таблица)."""
+    items = []
+    for beta in levels:
+        p_s, p_n = effect(beta)
+        probs_s = _draw_policy_probs(p_s, policy_spread, n_policies, rng)
+        probs_a = (rng.random((n_policies, n_scenes)) < probs_s[:, None]).astype(float)
+        probs_n = _draw_policy_probs(p_n, policy_spread, n_policies, rng)
+        probs_b = (rng.random((n_policies, n_scenes)) < probs_n[:, None]).astype(float)
+        items.append({"level": beta, "a": probs_a, "b": probs_b, "paired_policies": False})
+    table = decide_family(items, alpha=alpha, margin=margin, n_boot=n_boot, seed=int(rng.integers(1 << 31)))
+    beta_star, _ = family_threshold(table, levels=levels)
+    return beta_star, table
+
+
+def family_a_power(effect, true_beta_star, n_policies_list, n_scenes_list, policy_spread=0.0, n_rep=200,
+                   levels=FAMILY_A_LEVELS, alpha=ALPHA, margin=MARGIN, n_boot=2000, seed=0):
+    """Мощность всего правила семьи A: доля повторов, где процедура
+    (Холм по 6 сравнениям + подтверждение «хуже» на следующем β,
+    rssrl.stats.decide_family + family_threshold) находит ИМЕННО
+    true_beta_star — не просто «хоть что-то отклонила». true_beta_star=None
+    проверяет долю повторов, где правило корректно не находит порога (исход
+    «не установлено» допустим и может быть самим желаемым результатом —
+    например под нулевым эффектом или если истинное ухудшение только на
+    верхней точке сетки, см. rssrl.stats.beta_star).
+    Возвращает DataFrame: политик на тип, сцен, разброс политик, мощность."""
+    rng_master = np.random.default_rng(seed)
+    rows = []
+    for n_pol in n_policies_list:
+        for n_sc in n_scenes_list:
+            hits = 0
+            for _ in range(n_rep):
+                rng = np.random.default_rng(rng_master.integers(1 << 31))
+                beta_star, _ = _simulate_family_a_once(effect, n_pol, n_sc, policy_spread, rng, levels, alpha,
+                                                       margin, n_boot)
+                hits += beta_star == true_beta_star
+            rows.append({"политик на тип": n_pol, "сцен": n_sc, "разброс политик (std)": policy_spread,
+                         "истинный β*": true_beta_star, "повторов": n_rep, "мощность": hits / n_rep})
+    return pd.DataFrame(rows)
+
+
+def family_a_precision(n_policies, n_scenes, baseline=0.03, policy_spread=0.0, n_rep=200, levels=FAMILY_A_LEVELS,
+                       alpha=ALPHA, n_boot=2000, seed=0):
+    """Точность семьи A под нулевым эффектом (PPO_S+R и PPO_N−R с одной и той
+    же вероятностью baseline на каждом уровне): медианная полуширина
+    СОВМЕСТНОГО интервала семьи (ci_simult в decide_family, уровень
+    1 − alpha/m, m = len(levels)) по всем сравнениям и повторам. Это не
+    обычный 95% интервал по умолчанию и не замена projected_halfwidth,
+    который считает полуширину одного отдельного сравнения."""
+    no_effect = step_effect(math.inf, 0.0, baseline, levels)  # delta никогда не включается
+    rng_master = np.random.default_rng(seed)
+    widths = []
+    for _ in range(n_rep):
+        rng = np.random.default_rng(rng_master.integers(1 << 31))
+        _, table = _simulate_family_a_once(no_effect, n_policies, n_scenes, policy_spread, rng, levels, alpha,
+                                           MARGIN, n_boot)
+        widths.extend((hi - lo) / 2 for lo, hi in table["ci_simult"] if np.isfinite(lo))
+    return float(np.median(widths)) if widths else float("nan")
 
 
 if __name__ == "__main__":
